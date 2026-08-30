@@ -1,0 +1,20 @@
+{
+  "name": "Hiring Pipeline",
+  "description": "Employer-side recruiting management — open roles, candidates, interviews, and pipeline analytics.",
+  "category": "recipes",
+  "author": {
+    "name": "Open Brain Community"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": [],
+    "tools": ["Supabase CLI"]
+  },
+  "requires_primitives": ["deploy-edge-function", "remote-mcp", "rls"],
+  "tags": ["hiring", "recruiting", "candidates", "interviews", "pipeline", "rls"],
+  "difficulty": "advanced",
+  "estimated_time": "1 hour",
+  "created": "2026-08-30",
+  "updated": "2026-08-30"
+}
