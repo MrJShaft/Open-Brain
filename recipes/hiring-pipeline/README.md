@@ -98,6 +98,14 @@ Log feedback for Jordan Rivera's phone screen — strong communicator, rate it a
 ```
 
 ```
+Move Jordan Rivera to the interviewing stage
+```
+
+```
+Close the Senior AI Engineer role — filled, Jordan Rivera was hired
+```
+
+```
 Show me my hiring pipeline overview - how many candidates, what stages, upcoming interviews
 ```
 
@@ -105,16 +113,18 @@ Show me my hiring pipeline overview - how many candidates, what stages, upcoming
 
 1. **`add_open_role`** — Add a role you're hiring for (title, url, salary_min, salary_max, requirements, nice_to_haves, notes, status, posted_date, closing_date)
 2. **`add_candidate`** — Add a candidate to an open role's pipeline (open_role_id, full_name, email, phone, linkedin_url, source, status, resume_url, applied_date, notes)
-3. **`schedule_candidate_interview`** — Schedule an interview for a candidate (candidate_id, interview_type, scheduled_at, duration_minutes, interviewer_name, interviewer_title, notes)
-4. **`log_interview_notes`** — Add feedback/notes after an interview, update status to completed (interview_id, feedback, rating 1-5)
-5. **`get_pipeline_overview`** — Dashboard summary: counts by candidate status, upcoming interviews in next N days. This is your "how's hiring going?" tool.
-6. **`get_upcoming_interviews`** — List interviews in the next N days with full role/candidate context
+3. **`update_candidate_status`** — Move a candidate through the pipeline (candidate_id, status, response_date, notes)
+4. **`close_open_role`** — Close a role once it's filled or no longer being hired for (open_role_id, status: filled/cancelled, filled_date, notes)
+5. **`schedule_candidate_interview`** — Schedule an interview for a candidate (candidate_id, interview_type, scheduled_at, duration_minutes, interviewer_name, interviewer_title, notes)
+6. **`log_interview_notes`** — Add feedback/notes after an interview, update status to completed (interview_id, feedback, rating 1-5)
+7. **`get_pipeline_overview`** — Dashboard summary: counts by candidate status, upcoming interviews in next N days. This is your "how's hiring going?" tool.
+8. **`get_upcoming_interviews`** — List interviews in the next N days with full role/candidate context
 
 ## Expected Outcome
 
 After completing this recipe, you should be able to:
 
-1. Track every role you're hiring for
+1. Track every role you're hiring for, and close it out once it's filled
 2. Move candidates through a pipeline (sourced → screening → interviewing → offer → hired/rejected/withdrew)
 3. Schedule and log interviews with detailed notes and ratings
 4. Get pipeline analytics: candidates per stage, upcoming interviews, hiring activity
@@ -136,8 +146,8 @@ For common issues (connection errors, 401s, deployment problems), see [Common Tr
 - Verify UUIDs are correct and belong to the same user_id
 - Deleting an open role will cascade-delete all related candidates and interviews
 
-**Candidate status not updating**
-- `add_candidate` sets the initial status; move a candidate through later stages by updating the `candidates` row directly in Supabase, or add your own status-update tool if you need it from your AI client
+**Closing a role doesn't change its candidates' statuses**
+- `close_open_role` only updates the role itself. Candidates still in progress keep whatever status they're in — update them individually with `update_candidate_status` (e.g. mark the hire as `hired` and the rest as `rejected`)
 
 ## Notes for Contributors
 

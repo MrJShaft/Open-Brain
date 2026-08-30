@@ -60,6 +60,20 @@ const logInterviewNotesSchema = z.object({
   rating: z.number().min(1).max(5).optional().describe("Your assessment of how it went (1-5)"),
 });
 
+const updateCandidateStatusSchema = z.object({
+  candidate_id: z.string().describe("Candidate ID (UUID)"),
+  status: z.enum(["sourced", "screening", "interviewing", "offer", "hired", "rejected", "withdrew"]).describe("New candidate status"),
+  response_date: z.string().optional().describe("Date of this status change (YYYY-MM-DD)"),
+  notes: z.string().optional().describe("Notes about this status change"),
+});
+
+const closeOpenRoleSchema = z.object({
+  open_role_id: z.string().describe("Open role ID (UUID)"),
+  status: z.enum(["filled", "cancelled"]).optional().describe("How the role was closed (default: filled)"),
+  filled_date: z.string().optional().describe("Date the role was closed (YYYY-MM-DD, default: today)"),
+  notes: z.string().optional().describe("Notes about how the role was closed (e.g. which candidate was hired)"),
+});
+
 const getPipelineOverviewSchema = z.object({
   days_ahead: z.number().optional().describe("Number of days to look ahead for interviews (default: 7)"),
 });
@@ -137,6 +151,61 @@ async function handleAddCandidate(supabase: any, args: z.infer<typeof addCandida
     success: true,
     message: `Added candidate: ${full_name}`,
     candidate: data,
+  }, null, 2);
+}
+
+async function handleUpdateCandidateStatus(supabase: any, args: z.infer<typeof updateCandidateStatusSchema>, userId: string): Promise<string> {
+  const { candidate_id, status, response_date, notes } = args;
+
+  const update: Record<string, unknown> = { status };
+  if (response_date !== undefined) update.response_date = response_date;
+  if (notes !== undefined) update.notes = notes;
+
+  const { data, error } = await supabase
+    .from("candidates")
+    .update(update)
+    .eq("id", candidate_id)
+    .eq("user_id", userId)
+    .select()
+    .single();
+
+  if (error) {
+    throw new Error(`Failed to update candidate status: ${error.message}`);
+  }
+
+  return JSON.stringify({
+    success: true,
+    message: `Candidate status updated to ${status}`,
+    candidate: data,
+  }, null, 2);
+}
+
+async function handleCloseOpenRole(supabase: any, args: z.infer<typeof closeOpenRoleSchema>, userId: string): Promise<string> {
+  const { open_role_id, status, filled_date, notes } = args;
+  const resolvedStatus = status || "filled";
+
+  const update: Record<string, unknown> = {
+    status: resolvedStatus,
+    filled_date: filled_date || new Date().toISOString().slice(0, 10),
+  };
+  if (notes !== undefined) update.notes = notes;
+
+  const { data, error } = await supabase
+    .from("open_roles")
+    .update(update)
+    .eq("id", open_role_id)
+    .eq("user_id", userId)
+    .select()
+    .single();
+
+  if (error) {
+    throw new Error(`Failed to close open role: ${error.message}`);
+  }
+
+  return JSON.stringify({
+    success: true,
+    message: `Open role marked as ${resolvedStatus}`,
+    open_role: data,
   }, null, 2);
 }
 
@@ -350,6 +419,20 @@ app.post("*", async (c) => {
     "Add a candidate to the pipeline for an open role",
     addCandidateSchema.shape,
     async (args) => wrap(() => handleAddCandidate(supabase, args, userId))
+  );
+
+  server.tool(
+    "update_candidate_status",
+    "Move a candidate through the hiring pipeline (e.g. screening -> interviewing -> offer -> hired/rejected/withdrew)",
+    updateCandidateStatusSchema.shape,
+    async (args) => wrap(() => handleUpdateCandidateStatus(supabase, args, userId))
+  );
+
+  server.tool(
+    "close_open_role",
+    "Close an open role once it's filled or no longer being hired for",
+    closeOpenRoleSchema.shape,
+    async (args) => wrap(() => handleCloseOpenRole(supabase, args, userId))
   );
 
   server.tool(

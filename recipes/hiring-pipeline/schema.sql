@@ -17,9 +17,13 @@ CREATE TABLE IF NOT EXISTS open_roles (
     status TEXT DEFAULT 'open' CHECK (status IN ('open', 'on_hold', 'filled', 'cancelled')),
     posted_date DATE,
     closing_date DATE,
+    filled_date DATE,
     created_at TIMESTAMPTZ DEFAULT now() NOT NULL,
     updated_at TIMESTAMPTZ DEFAULT now() NOT NULL
 );
+
+-- Upgrade path for databases that ran this schema before filled_date existed
+ALTER TABLE open_roles ADD COLUMN IF NOT EXISTS filled_date DATE;
 
 -- Table: candidates
 -- People in the running for an open role
