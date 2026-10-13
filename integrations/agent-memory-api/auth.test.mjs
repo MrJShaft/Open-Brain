@@ -6,6 +6,7 @@ import {
   isWorkspaceAllowed,
   ownsPersonalMemory,
   ownsRecallTrace,
+  hasCapability,
   sha256Hex,
 } from "./auth.js";
 
@@ -34,7 +35,7 @@ test("a bearer token resolves through its digest to one immutable Agent and work
   const lookup = await credentialStore();
   const agentA = await authenticateAgent(`Bearer ${tokenA}`, lookup);
 
-  assert.deepEqual(agentA, { agentId: "agent_a", workspaceIds: ["workspace_a"] });
+  assert.deepEqual(agentA, { agentId: "agent_a", workspaceIds: ["workspace_a"], capabilities: [] });
   assert.equal(await authenticateAgent(`Bearer ${"c".repeat(43)}`, lookup), null);
 });
 
@@ -115,4 +116,17 @@ test("a trace/request-ID access attempt is denied across Agent and workspace bou
     request_payload: { authenticated_agent_id: "agent_a" },
   }), false);
   assert.equal(ownsRecallTrace(agentA, { workspace_id: "workspace_a", request_payload: {} }), false);
+});
+
+test("capabilities are parsed, deduplicated, and unknown capabilities fail closed", async () => {
+  const digest = await sha256Hex(tokenA);
+  const row = (capabilities) => async () => ({ agent_id: "agent_a", token_sha256: digest, workspace_ids: ["w"], enabled: true, capabilities });
+  const approver = await authenticateAgent(`Bearer ${tokenA}`, row(["shared:approve", "shared:approve"]));
+  assert.deepEqual(approver.capabilities, ["shared:approve"]);
+  assert.equal(hasCapability(approver, "shared:approve"), true);
+  assert.equal(hasCapability(approver, "thoughts:read"), false);
+  const plain = await authenticateAgent(`Bearer ${tokenA}`, row(undefined));
+  assert.equal(hasCapability(plain, "shared:approve"), false);
+  await assert.rejects(authenticateAgent(`Bearer ${tokenA}`, row(["admin:*"])));
+  await assert.rejects(authenticateAgent(`Bearer ${tokenA}`, row("shared:approve")));
 });

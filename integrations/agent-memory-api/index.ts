@@ -5,6 +5,7 @@ import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
 import {
   authenticateAgent,
+  hasCapability,
   isWorkspaceAllowed,
   ownsPersonalMemory,
   ownsRecallTrace,
@@ -53,14 +54,16 @@ const recallSchema = z.object({
     provider: z.string().nullable().optional(),
     model: z.string().nullable().optional(),
   }).default({}),
-  query: z.string().min(1),
+  query: z.string().min(1).max(4000),
   entities: z.record(z.string(), z.array(z.string())).default({}),
   scope: z.object({
     visibility: z.string().nullable().optional(),
     project_only: z.boolean().default(true),
-    include_unconfirmed: z.boolean().default(false),
+    // Recall is always scoped to the calling Agent's own memories, so its own
+    // pending (unreviewed) memories are included by default.
+    include_unconfirmed: z.boolean().default(true),
     include_stale: z.boolean().default(false),
-  }).default({ project_only: true, include_unconfirmed: false, include_stale: false }),
+  }).default({ project_only: true, include_unconfirmed: true, include_stale: false }),
   limits: z.object({
     max_items: z.number().int().min(1).max(50).default(10),
     max_tokens: z.number().int().min(256).max(20000).default(4000),
@@ -69,19 +72,21 @@ const recallSchema = z.object({
   sensitivity: z.record(z.string(), z.boolean()).default({}),
 });
 
+const memoryText = z.string().min(1).max(15000);
+const memoryList = z.array(memoryText).max(20).default([]);
 const memoryPayloadSchema = z.object({
-  decisions: z.array(z.string()).default([]),
-  outputs: z.array(z.string()).default([]),
-  lessons: z.array(z.string()).default([]),
-  constraints: z.array(z.string()).default([]),
-  unresolved_questions: z.array(z.string()).default([]),
-  next_steps: z.array(z.string()).default([]),
-  failures: z.array(z.string()).default([]),
+  decisions: memoryList,
+  outputs: memoryList,
+  lessons: memoryList,
+  constraints: memoryList,
+  unresolved_questions: memoryList,
+  next_steps: memoryList,
+  failures: memoryList,
   artifacts: z.array(z.object({
     kind: z.string(),
     uri: z.string(),
     description: z.string().nullable().optional(),
-  })).default([]),
+  })).max(20).default([]),
   entities: z.record(z.string(), z.array(z.string())).default({}),
 });
 
@@ -140,8 +145,20 @@ const reviewSchema = z.object({
   content: z.string().optional(),
   summary: z.string().optional(),
   visibility: z.string().optional(),
-  related_memory_id: z.string().optional(),
+  related_memory_id: z.string().uuid().optional(),
 });
+
+const lockSchema = z.object({
+  workspace_id: z.string().min(1).max(200),
+  lock_key: z.string().min(1).max(200),
+  ttl_seconds: z.number().int().min(10).max(86400).default(900),
+  note: z.string().max(500).nullable().optional(),
+});
+
+function serverError(c: { json: (b: unknown, s: 500, h: Record<string, string>) => Response }, err: unknown) {
+  console.error("agent-memory-api error:", err);
+  return c.json({ error: "Internal error" }, 500, corsHeaders);
+}
 
 const sharedMemorySchema = z.object({
   workspace_id: z.string().min(1).max(200),
@@ -155,7 +172,7 @@ const sharedMemorySchema = z.object({
   idempotency_key: z.string().min(1).max(180).nullable().optional(),
 });
 
-type AppEnv = { Variables: { agentId: string; workspaceIds: string[] } };
+type AppEnv = { Variables: { agentId: string; workspaceIds: string[]; capabilities: string[] } };
 
 type AgentMemory = {
   id: string;
@@ -252,7 +269,8 @@ function scopeMatches(memory: AgentMemory, req: z.infer<typeof recallSchema>): b
   if (req.scope.project_only && req.project_id && memory.project_id !== req.project_id) return false;
   if (!req.scope.include_stale && ["stale", "superseded", "rejected", "disputed"].includes(memory.lifecycle_status)) return false;
   if (!req.scope.include_unconfirmed && memory.requires_user_confirmation && memory.review_status === "pending") return false;
-  if (memory.visibility === "personal" && req.scope.visibility !== "personal") return false;
+  // Personal visibility is not filtered: recall only ever returns the caller's own memories.
+  if (req.scope.visibility && req.scope.visibility !== memory.visibility) return false;
   return true;
 }
 
@@ -375,7 +393,7 @@ app.use("*", async (c, next) => {
     agent = await authenticateAgent(c.req.header("authorization"), async (tokenDigest: string) => {
       const { data, error } = await supabase
         .from("agent_api_credentials")
-        .select("agent_id, token_sha256, workspace_ids, enabled")
+        .select("agent_id, token_sha256, workspace_ids, enabled, capabilities")
         .eq("token_sha256", tokenDigest)
         .eq("enabled", true)
         .maybeSingle();
@@ -388,10 +406,25 @@ app.use("*", async (c, next) => {
   if (!agent) return c.json({ error: "Invalid or missing Agent bearer token" }, 401, corsHeaders);
   c.set("agentId", agent.agentId);
   c.set("workspaceIds", agent.workspaceIds);
+  c.set("capabilities", agent.capabilities);
   await next();
+  if (c.req.path !== "/health") {
+    // Per-key usage log. Endpoint is the matched route, or the MCP tool name when proxied.
+    const tool = c.req.header("x-agent-memory-tool");
+    const endpoint = tool && /^[a-z_]{1,64}$/.test(tool) ? `mcp:${tool}` : `${c.req.method} ${c.req.routePath}`;
+    const { error } = await supabase.from("agent_api_key_usage").insert({ agent_id: agent.agentId, endpoint, status: c.res.status });
+    if (error) console.error("usage log failed:", error.message);
+  }
 });
 
-app.get("/health", (c) => c.json({ ok: true, service: "agent-memory-api", version: "0.3.0" }, 200, corsHeaders));
+app.get("/health", (c) => c.json({
+  ok: true,
+  service: "agent-memory-api",
+  version: "0.4.0",
+  agent_id: c.get("agentId"),
+  workspace_ids: c.get("workspaceIds"),
+  capabilities: c.get("capabilities"),
+}, 200, corsHeaders));
 
 app.post("/recall", async (c) => {
   const parsed = recallSchema.safeParse(await c.req.json());
@@ -403,17 +436,18 @@ app.post("/recall", async (c) => {
   }
 
   const embedding = await getEmbedding(req.query);
-  const { data: matches, error: matchError } = await supabase.rpc("match_thoughts", {
+  const { data: matches, error: matchError } = await supabase.rpc("match_agent_memories", {
     query_embedding: embedding,
+    p_workspace_id: req.workspace_id,
+    p_agent_id: agent.agentId,
     match_threshold: 0.25,
     match_count: Math.max(req.limits.max_items * 4, 20),
-    filter: {},
   });
-  if (matchError) return c.json({ error: matchError.message }, 500, corsHeaders);
+  if (matchError) return serverError(c, matchError);
 
-  const similarityByThought = new Map<string, number>();
-  for (const item of matches || []) similarityByThought.set(item.id, item.similarity);
-  const thoughtIds = Array.from(similarityByThought.keys());
+  const similarityByMemory = new Map<string, number>();
+  for (const item of matches || []) similarityByMemory.set(item.id, item.similarity);
+  const memoryIds = Array.from(similarityByMemory.keys());
 
   let memoryQuery = supabase
     .from("agent_memories")
@@ -422,15 +456,15 @@ app.post("/recall", async (c) => {
     .eq("metadata->>authenticated_agent_id", agent.agentId)
     .order("created_at", { ascending: false })
     .limit(100);
-  if (thoughtIds.length > 0) memoryQuery = memoryQuery.in("thought_id", thoughtIds);
+  if (memoryIds.length > 0) memoryQuery = memoryQuery.in("id", memoryIds);
 
   const { data: rawMemories, error: memoryError } = await memoryQuery;
-  if (memoryError) return c.json({ error: memoryError.message }, 500, corsHeaders);
+  if (memoryError) return serverError(c, memoryError);
 
   const ranked = ((rawMemories || []) as AgentMemory[])
     .filter((m) => ownsPersonalMemory(agent, m.workspace_id, m.metadata) && scopeMatches(m, req))
     .map((m) => {
-      const similarity = similarityByThought.get(m.thought_id || "") || 0;
+      const similarity = similarityByMemory.get(m.id) || 0;
       return { ...m, similarity, ranking_score: rankMemory(m, similarity) };
     })
     .sort((a, b) => b.ranking_score - a.ranking_score)
@@ -450,7 +484,7 @@ app.post("/recall", async (c) => {
     request_payload: { ...req, authenticated_agent_id: agent.agentId },
     response_policy: { max_items: req.limits.max_items, include_unconfirmed: req.scope.include_unconfirmed },
   }).select("*").single();
-  if (traceError) return c.json({ error: traceError.message }, 500, corsHeaders);
+  if (traceError) return serverError(c, traceError);
 
   if (ranked.length > 0) {
     await supabase.from("agent_memory_recall_items").insert(ranked.map((memory, index) => ({
@@ -532,33 +566,12 @@ app.post("/writeback", async (c) => {
       continue;
     }
 
+    // Agent memories keep their own embedding; public.thoughts (the user's brain) is never touched.
     const embedding = await getEmbedding(row.content);
-    const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
-      p_content: row.content,
-      p_payload: {
-        metadata: {
-          source: "agent_memory",
-          source_type: "agent_memory",
-          type: row.memory_type,
-          topics: req.memory_payload.entities.topics || [],
-          people: req.memory_payload.entities.people || [],
-          agent_memory: {
-            runtime: req.runtime.name,
-            authenticated_agent_id: authenticatedAgentId,
-            task_id: req.task_id,
-            flow_id: req.flow_id,
-            provenance_status: effectiveProvenanceStatus,
-          },
-        },
-      },
-    });
-    if (upsertError) return c.json({ error: upsertError.message }, 500, corsHeaders);
-
-    const thoughtId = upsertResult?.id;
-    if (thoughtId) await supabase.from("thoughts").update({ embedding }).eq("id", thoughtId);
 
     const { data: memory, error: memoryError } = await supabase.from("agent_memories").insert({
-      thought_id: thoughtId ?? null,
+      thought_id: null,
+      embedding,
       workspace_id: req.workspace_id,
       project_id: req.project_id ?? null,
       channel_kind: req.channel.kind ?? null,
@@ -593,7 +606,7 @@ app.post("/writeback", async (c) => {
         writeback_schema_version: req.schema_version,
       },
     }).select("*").single();
-    if (memoryError) return c.json({ error: memoryError.message }, 500, corsHeaders);
+    if (memoryError) return serverError(c, memoryError);
 
     if (req.source_refs.length > 0) {
       await supabase.from("agent_memory_source_refs").insert(req.source_refs.map((source) => ({
@@ -653,7 +666,7 @@ app.post("/recall/:request_id/usage", async (c) => {
     .from("agent_memory_recall_items")
     .select("memory_id")
     .eq("trace_id", trace.id);
-  if (traceItemsError) return c.json({ error: traceItemsError.message }, 500, corsHeaders);
+  if (traceItemsError) return serverError(c, traceItemsError);
   const candidateMemoryIds = [...new Set((traceItems || []).map((item) => item.memory_id))];
   let traceMemoryIds = new Set<string>();
   if (candidateMemoryIds.length > 0) {
@@ -663,7 +676,7 @@ app.post("/recall/:request_id/usage", async (c) => {
       .in("id", candidateMemoryIds)
       .eq("workspace_id", trace.workspace_id)
       .eq("metadata->>authenticated_agent_id", agent.agentId);
-    if (ownedMemoriesError) return c.json({ error: ownedMemoriesError.message }, 500, corsHeaders);
+    if (ownedMemoriesError) return serverError(c, ownedMemoriesError);
     traceMemoryIds = new Set((ownedTraceMemories || [])
       .filter((memory) => ownsPersonalMemory(agent, memory.workspace_id, memory.metadata))
       .map((memory) => memory.id));
@@ -699,7 +712,7 @@ app.get("/memories/review", async (c) => {
   let q = supabase.from("agent_memories").select("*").eq("workspace_id", workspace_id).eq("metadata->>authenticated_agent_id", agent.agentId).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
   if (project_id) q = q.eq("project_id", project_id);
   const { data, error } = await q;
-  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (error) return serverError(c, error);
   const memories = ((data || []) as AgentMemory[])
     .filter((memory) => ownsPersonalMemory(agent, memory.workspace_id, memory.metadata))
     .map(responseMemory);
@@ -735,10 +748,10 @@ app.get("/memories", async (c) => {
   if (lifecycle_status) q = q.eq("lifecycle_status", lifecycle_status);
   if (runtime_name) q = q.eq("runtime_name", runtime_name);
   if (memory_type) q = q.eq("memory_type", memory_type);
-  if (task_id_prefix) q = q.like("task_id", `${task_id_prefix}%`);
+  if (task_id_prefix) q = q.like("task_id", `${task_id_prefix.replace(/[\\%_]/g, (ch) => `\\${ch}`)}%`);
 
   const { data, error } = await q;
-  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (error) return serverError(c, error);
   const memories = ((data || []) as AgentMemory[])
     .filter((memory) => ownsPersonalMemory(agent, memory.workspace_id, memory.metadata))
     .map(responseMemory);
@@ -788,7 +801,7 @@ app.get("/shared-memories", async (c) => {
   else query = query.in("review_status", ["confirmed", "evidence_only"]);
 
   const { data, error } = await query;
-  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  if (error) return serverError(c, error);
   const memories = (data || []).map((memory) => responseSharedMemory(memory as Record<string, unknown>));
   return c.json({ memories, count: memories.length }, 200, corsHeaders);
 });
@@ -806,6 +819,9 @@ app.post("/shared-memories", async (c) => {
   if (req.sharing_scope !== "project" && req.project_id) {
     return c.json({ error: "project_id must be omitted for workspace- or organization-scoped shared memories" }, 400, corsHeaders);
   }
+  if (req.sharing_scope === "organization" && !hasCapability({ capabilities: c.get("capabilities") }, "shared:approve")) {
+    return c.json({ error: "organization-scoped shared writes require the shared:approve capability" }, 403, corsHeaders);
+  }
 
   const unsafe = [...unsafeReasons(req.summary), ...unsafeReasons(req.content)];
   if (unsafe.length > 0) return c.json({ error: "Unsafe shared-memory write blocked", reasons: [...new Set(unsafe)] }, 422, corsHeaders);
@@ -819,7 +835,7 @@ app.post("/shared-memories", async (c) => {
       .eq("created_by_agent", agentId)
       .eq("idempotency_key", idempotencyKey)
       .maybeSingle();
-    if (existingError) return c.json({ error: existingError.message }, 500, corsHeaders);
+    if (existingError) return serverError(c, existingError);
     if (existing) return c.json({ memory: responseSharedMemory(existing), deduplicated: true }, 200, corsHeaders);
   }
 
@@ -853,7 +869,7 @@ app.post("/shared-memories", async (c) => {
         return c.json({ memory: responseSharedMemory(existingAfterConflict), deduplicated: true }, 200, corsHeaders);
       }
     }
-    return c.json({ error: error.message }, 500, corsHeaders);
+    return serverError(c, error);
   }
 
   await audit("memory_written", {
@@ -866,6 +882,52 @@ app.post("/shared-memories", async (c) => {
     memory_type: req.memory_type,
   });
   return c.json({ memory: responseSharedMemory(memory), deduplicated: false }, 201, corsHeaders);
+});
+
+app.post("/shared-memories/:id/approve", async (c) => {
+  if (!hasCapability({ capabilities: c.get("capabilities") }, "shared:approve")) {
+    return c.json({ error: "shared:approve capability required" }, 403, corsHeaders);
+  }
+  const id = c.req.param("id");
+  if (!z.string().uuid().safeParse(id).success) return c.json({ error: "Shared memory not found" }, 404, corsHeaders);
+  const body = await c.req.json().catch(() => ({}));
+  const parsed = z.object({
+    review_status: z.enum(["confirmed", "evidence_only"]).default("confirmed"),
+    notes: z.string().max(1000).nullable().optional(),
+  }).safeParse(body ?? {});
+  if (!parsed.success) return c.json({ error: "Invalid approve payload", details: parsed.error.flatten() }, 400, corsHeaders);
+
+  const { data: before, error: beforeError } = await supabase.from("shared_agent_memories").select("*").eq("id", id).maybeSingle();
+  if (beforeError) return serverError(c, beforeError);
+  if (!before || !isWorkspaceAllowed(c.get("workspaceIds"), before.workspace_id)) {
+    return c.json({ error: "Shared memory not found" }, 404, corsHeaders);
+  }
+  const agentId = c.get("agentId");
+  const { data: after, error } = await supabase.from("shared_agent_memories").update({
+    review_status: parsed.data.review_status,
+    requires_user_confirmation: false,
+    updated_at: new Date().toISOString(),
+    metadata: { ...(before.metadata || {}), approved_by_agent: agentId, approved_at: new Date().toISOString(), approval_notes: parsed.data.notes ?? null },
+  }).eq("id", id).eq("workspace_id", before.workspace_id).select("*").single();
+  if (error) return serverError(c, error);
+  await audit("memory_confirmed", {
+    workspace_id: before.workspace_id, project_id: before.project_id, actor_kind: "agent",
+    actor_label: agentId, shared_memory_id: id, review_status: parsed.data.review_status,
+  });
+  return c.json({ memory: responseSharedMemory(after) }, 200, corsHeaders);
+});
+
+// Future: read access to the user's thoughts. Disabled unless a key carries thoughts:read (none do today).
+app.post("/thoughts/search", async (c) => {
+  if (!hasCapability({ capabilities: c.get("capabilities") }, "thoughts:read")) {
+    return c.json({ error: "thoughts:read capability required" }, 403, corsHeaders);
+  }
+  const parsed = z.object({ query: z.string().min(1).max(4000), limit: z.number().int().min(1).max(25).default(10) }).safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "Invalid search payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  const embedding = await getEmbedding(parsed.data.query);
+  const { data, error } = await supabase.rpc("match_thoughts", { query_embedding: embedding, match_threshold: 0.5, match_count: parsed.data.limit, filter: {} });
+  if (error) return serverError(c, error);
+  return c.json({ thoughts: data || [] }, 200, corsHeaders);
 });
 
 app.get("/memories/:id", async (c) => {
@@ -888,7 +950,7 @@ app.patch("/memories/:id/review", async (c) => {
   const parsed = reviewSchema.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Invalid review payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
-  if (!["reject", "mark_stale", "dispute"].includes(req.action)) {
+  if (!["reject", "mark_stale", "dispute", "supersede"].includes(req.action)) {
     return c.json({ error: "Agent credentials cannot perform this review action; use user review for confirmation, evidence promotion, edits, and scope changes" }, 403, corsHeaders);
   }
   const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
@@ -904,7 +966,18 @@ app.patch("/memories/:id/review", async (c) => {
   }
 
   const updates: Record<string, unknown> = {};
-  if (req.action === "reject") {
+  if (req.action === "supersede") {
+    if (!req.related_memory_id || req.related_memory_id === id) {
+      return c.json({ error: "supersede requires related_memory_id (the newer memory)" }, 400, corsHeaders);
+    }
+    const { data: newer } = await supabase.from("agent_memories").select("id, workspace_id, metadata")
+      .eq("id", req.related_memory_id).eq("metadata->>authenticated_agent_id", agent.agentId).maybeSingle();
+    if (!newer || !ownsPersonalMemory(agent, newer.workspace_id, newer.metadata) || newer.workspace_id !== before.workspace_id) {
+      return c.json({ error: "related_memory_id not found" }, 404, corsHeaders);
+    }
+    updates.lifecycle_status = "superseded";
+    updates.can_use_as_instruction = false;
+  } else if (req.action === "reject") {
     updates.review_status = "rejected";
     updates.lifecycle_status = "rejected";
     updates.can_use_as_instruction = false;
@@ -927,7 +1000,7 @@ app.patch("/memories/:id/review", async (c) => {
     .eq("metadata->>authenticated_agent_id", agent.agentId)
     .select("*")
     .single();
-  if (updateError) return c.json({ error: updateError.message }, 500, corsHeaders);
+  if (updateError) return serverError(c, updateError);
 
   await supabase.from("agent_memory_review_actions").insert({
     memory_id: id,
@@ -939,7 +1012,15 @@ app.patch("/memories/:id/review", async (c) => {
     after,
   });
 
+  if (req.action === "supersede") {
+    await supabase.from("agent_memory_relations").upsert([
+      { from_memory_id: req.related_memory_id, to_memory_id: id, relation: "supersedes" },
+      { from_memory_id: id, to_memory_id: req.related_memory_id, relation: "superseded_by" },
+    ], { onConflict: "from_memory_id,to_memory_id,relation", ignoreDuplicates: true });
+  }
+
   const eventMap: Record<string, string> = {
+    supersede: "memory_superseded",
     reject: "memory_rejected",
     dispute: "memory_disputed",
   };
@@ -955,6 +1036,59 @@ app.patch("/memories/:id/review", async (c) => {
   return c.json({ memory: after }, 200, corsHeaders);
 });
 
+// Forget: hard-delete one of this Agent's own memories (cascades refs/artifacts/relations/recall items).
+app.delete("/memories/:id", async (c) => {
+  const id = c.req.param("id");
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
+  const { data: before } = await supabase.from("agent_memories").select("id, workspace_id, project_id, metadata")
+    .eq("id", id).eq("metadata->>authenticated_agent_id", agent.agentId).maybeSingle();
+  if (!before || !ownsPersonalMemory(agent, before.workspace_id, before.metadata)) {
+    return c.json({ error: "Memory not found" }, 404, corsHeaders);
+  }
+  const { error } = await supabase.from("agent_memories").delete()
+    .eq("id", id).eq("metadata->>authenticated_agent_id", agent.agentId);
+  if (error) return serverError(c, error);
+  await audit("memory_rejected", {
+    workspace_id: before.workspace_id, project_id: before.project_id, actor_kind: "agent",
+    actor_label: agent.agentId, action: "forget", forgotten_memory_id: id,
+  });
+  return c.json({ ok: true, forgotten: id }, 200, corsHeaders);
+});
+
+app.post("/locks/acquire", async (c) => {
+  const parsed = lockSchema.safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Invalid lock payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  const req = parsed.data;
+  if (!isWorkspaceAllowed(c.get("workspaceIds"), req.workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
+  const { data, error } = await supabase.rpc("agent_memory_acquire_lock", {
+    p_workspace_id: req.workspace_id, p_lock_key: req.lock_key, p_agent_id: c.get("agentId"),
+    p_ttl_seconds: req.ttl_seconds, p_note: req.note ?? null,
+  });
+  if (error) return serverError(c, error);
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row || !row.lock_key) {
+    const { data: held } = await supabase.from("agent_memory_locks").select("holder_agent_id, expires_at")
+      .eq("workspace_id", req.workspace_id).eq("lock_key", req.lock_key).maybeSingle();
+    return c.json({ acquired: false, holder_agent_id: held?.holder_agent_id ?? null, expires_at: held?.expires_at ?? null }, 409, corsHeaders);
+  }
+  return c.json({ acquired: true, lock: row }, 200, corsHeaders);
+});
+
+app.post("/locks/release", async (c) => {
+  const parsed = lockSchema.pick({ workspace_id: true, lock_key: true }).safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Invalid lock payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  if (!isWorkspaceAllowed(c.get("workspaceIds"), parsed.data.workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
+  const { data, error } = await supabase.from("agent_memory_locks").delete()
+    .eq("workspace_id", parsed.data.workspace_id).eq("lock_key", parsed.data.lock_key)
+    .eq("holder_agent_id", c.get("agentId")).select("lock_key");
+  if (error) return serverError(c, error);
+  return c.json({ released: (data || []).length > 0 }, 200, corsHeaders);
+});
+
 app.get("/recall-traces/:request_id", async (c) => {
   const request_id = c.req.param("request_id");
   const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
@@ -968,7 +1102,7 @@ app.get("/recall-traces/:request_id", async (c) => {
     return c.json({ error: "Recall trace not found" }, 404, corsHeaders);
   }
   const { data: items, error: itemError } = await supabase.from("agent_memory_recall_items").select("*, agent_memories(*)").eq("trace_id", trace.id).order("rank");
-  if (itemError) return c.json({ error: itemError.message }, 500, corsHeaders);
+  if (itemError) return serverError(c, itemError);
   const ownedItems = (items || []).filter((item) => {
     const memory = item.agent_memories as unknown as AgentMemory | null;
     return Boolean(memory && ownsPersonalMemory(agent, memory.workspace_id, memory.metadata));

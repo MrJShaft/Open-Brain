@@ -1,4 +1,6 @@
 const SHA256_HEX = /^[a-f0-9]{64}$/i;
+/** Capabilities a credential may carry. Anything else fails closed. */
+export const KNOWN_CAPABILITIES = Object.freeze(["thoughts:read", "shared:approve"]);
 const BEARER_TOKEN = /^Bearer\s+([A-Za-z0-9_-]{43,})$/i;
 
 export async function sha256Hex(value) {
@@ -44,7 +46,17 @@ export async function authenticateAgent(authorization, lookupCredentialByDigest)
     workspaceIds.push(workspaceId);
   }
 
-  return { agentId: credential.agent_id, workspaceIds };
+  const rawCapabilities = credential.capabilities ?? [];
+  if (!Array.isArray(rawCapabilities) || rawCapabilities.some((cap) => typeof cap !== "string" || !KNOWN_CAPABILITIES.includes(cap))) {
+    throw new Error("Credential registry contains an invalid capability.");
+  }
+  const capabilities = [...new Set(rawCapabilities)];
+
+  return { agentId: credential.agent_id, workspaceIds, capabilities };
+}
+
+export function hasCapability(agent, capability) {
+  return Boolean(agent && Array.isArray(agent.capabilities) && agent.capabilities.includes(capability));
 }
 
 export function isWorkspaceAllowed(workspaceIds, workspaceId) {
