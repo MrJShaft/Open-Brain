@@ -3,20 +3,17 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { Hono } from "hono";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
+import { authenticateAgent, parseAgentKeyHashes } from "./auth.js";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
-const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
+const AGENT_API_KEY_HASHES = parseAgentKeyHashes(Deno.env.get("AGENT_API_KEY_HASHES_JSON") ?? "");
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, x-brain-key",
-  "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
-};
+const corsHeaders = { "Cache-Control": "no-store" };
 
 const runtimeSchema = z.object({
   name: z.string().default("unknown"),
@@ -142,6 +139,20 @@ const reviewSchema = z.object({
   related_memory_id: z.string().optional(),
 });
 
+const sharedMemorySchema = z.object({
+  workspace_id: z.string().min(1).max(200),
+  project_id: z.string().min(1).max(200).nullable().optional(),
+  sharing_scope: z.enum(["project", "workspace", "organization"]).default("project"),
+  memory_type: z.enum(["decision", "output", "lesson", "constraint", "open_question", "failure", "artifact_reference", "work_log"]),
+  summary: z.string().min(1).max(500),
+  content: z.string().min(1).max(15000),
+  provenance_status: z.enum(["observed", "inferred", "generated"]).default("generated"),
+  confidence: z.number().min(0).max(1).default(0.5),
+  idempotency_key: z.string().min(1).max(180).nullable().optional(),
+});
+
+type AppEnv = { Variables: { agentId: string } };
+
 type AgentMemory = {
   id: string;
   thought_id: string | null;
@@ -194,11 +205,6 @@ async function getEmbedding(text: string): Promise<number[]> {
   if (!r.ok) throw new Error(`OpenRouter embeddings failed: ${r.status} ${await r.text()}`);
   const d = await r.json();
   return d.data[0].embedding;
-}
-
-function auth(c: { req: { header: (name: string) => string | undefined; url: string } }) {
-  const provided = c.req.header("x-brain-key") || new URL(c.req.url).searchParams.get("key");
-  return provided && provided === MCP_ACCESS_KEY;
 }
 
 function unsafeReasons(text: string): string[] {
@@ -298,6 +304,36 @@ function responseMemory(memory: AgentMemory) {
   };
 }
 
+function responseSharedMemory(memory: Record<string, unknown>) {
+  return {
+    memory_id: memory.id,
+    summary: memory.summary,
+    content: memory.content,
+    memory_type: memory.memory_type,
+    scope: {
+      workspace_id: memory.workspace_id,
+      project_id: memory.project_id,
+      sharing_scope: memory.sharing_scope,
+    },
+    provenance: {
+      status: memory.provenance_status,
+      confidence: Number(memory.confidence),
+      created_by_agent: memory.created_by_agent,
+    },
+    use_policy: {
+      can_use_as_instruction: memory.can_use_as_instruction,
+      can_use_as_evidence: memory.can_use_as_evidence,
+      requires_user_confirmation: memory.requires_user_confirmation,
+    },
+    review_status: memory.review_status,
+    lifecycle_status: memory.lifecycle_status,
+    freshness: {
+      created_at: memory.created_at,
+      updated_at: memory.updated_at,
+    },
+  };
+}
+
 function recallResponseSchema(reqSchemaVersion: string) {
   return reqSchemaVersion === "openbrain.openclaw.recall.v1"
     ? "openbrain.openclaw.recall_response.v1"
@@ -325,16 +361,18 @@ async function audit(event_type: string, payload: Record<string, unknown>) {
   });
 }
 
-const app = new Hono();
+const app = new Hono<AppEnv>();
 
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
 
 app.use("*", async (c, next) => {
-  if (!auth(c)) return c.json({ error: "Invalid or missing access key" }, 401, corsHeaders);
+  const agentId = await authenticateAgent(c.req.header("authorization"), AGENT_API_KEY_HASHES);
+  if (!agentId) return c.json({ error: "Invalid or missing Agent bearer token" }, 401, corsHeaders);
+  c.set("agentId", agentId);
   await next();
 });
 
-app.get("/health", (c) => c.json({ ok: true, service: "agent-memory-api", version: "0.1.0" }, 200, corsHeaders));
+app.get("/health", (c) => c.json({ ok: true, service: "agent-memory-api", version: "0.2.0" }, 200, corsHeaders));
 
 app.post("/recall", async (c) => {
   const parsed = recallSchema.safeParse(await c.req.json());
@@ -425,6 +463,7 @@ app.post("/writeback", async (c) => {
   const parsed = writebackSchema.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Invalid write-back payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
+  const authenticatedAgentId = c.get("agentId");
   const rows = memoryRows(req);
   if (rows.length === 0) return c.json({ error: "memory_payload produced no memory rows" }, 400, corsHeaders);
 
@@ -445,7 +484,9 @@ app.post("/writeback", async (c) => {
   const created = [];
   const provider = req.models_used[0]?.provider ?? null;
   const model = req.models_used[0]?.model ?? null;
-  const defaultInstruction = ["user_confirmed", "imported"].includes(req.provenance.default_status) && !req.provenance.requires_review;
+  const effectiveProvenanceStatus = ["observed", "inferred"].includes(req.provenance.default_status)
+    ? req.provenance.default_status
+    : "generated";
 
   for (const [index, row] of rows.entries()) {
     const content_hash = await sha256Hex(`${row.memory_type}:${row.content}`);
@@ -474,9 +515,10 @@ app.post("/writeback", async (c) => {
           people: req.memory_payload.entities.people || [],
           agent_memory: {
             runtime: req.runtime.name,
+            authenticated_agent_id: authenticatedAgentId,
             task_id: req.task_id,
             flow_id: req.flow_id,
-            provenance_status: req.provenance.default_status,
+            provenance_status: effectiveProvenanceStatus,
           },
         },
       },
@@ -497,24 +539,25 @@ app.post("/writeback", async (c) => {
       memory_type: row.memory_type,
       summary: row.content.replace(/\s+/g, " ").slice(0, 140),
       content: row.content,
-      provenance_status: req.provenance.default_status,
+      provenance_status: effectiveProvenanceStatus,
       confidence: req.provenance.confidence,
-      created_by: req.provenance.default_status === "imported" ? "import" : "agent",
+      created_by: "agent",
       runtime_name: req.runtime.name,
       runtime_version: req.runtime.version ?? null,
       provider,
       model,
       task_id: req.task_id ?? null,
       flow_id: req.flow_id ?? null,
-      can_use_as_instruction: defaultInstruction,
+      can_use_as_instruction: false,
       can_use_as_evidence: true,
-      requires_user_confirmation: !defaultInstruction,
-      review_status: defaultInstruction ? "confirmed" : "pending",
-      last_confirmed_at: defaultInstruction ? new Date().toISOString() : null,
+      requires_user_confirmation: true,
+      review_status: "pending",
+      last_confirmed_at: null,
       stale_after: staleAfter(req.retention.stale_after_days),
       idempotency_key,
       content_hash,
       metadata: {
+        authenticated_agent_id: authenticatedAgentId,
         source_refs: req.source_refs,
         models_used: req.models_used,
         retention: req.retention,
@@ -549,9 +592,10 @@ app.post("/writeback", async (c) => {
       project_id: req.project_id,
       memory_id: memory.id,
       runtime_name: req.runtime.name,
+      actor_label: authenticatedAgentId,
       task_id: req.task_id,
       actor_kind: "agent",
-      provenance_status: req.provenance.default_status,
+      provenance_status: effectiveProvenanceStatus,
       review_status: memory.review_status,
     });
     created.push(memory);
@@ -622,6 +666,123 @@ app.get("/memories", async (c) => {
   return c.json({ memories: (data || []).map(responseMemory), count: data?.length || 0 }, 200, corsHeaders);
 });
 
+app.get("/shared-memories", async (c) => {
+  const workspace_id = c.req.query("workspace_id");
+  if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+
+  const project_id = c.req.query("project_id");
+  const requestedScope = c.req.query("sharing_scope") || (project_id ? "project" : "workspace");
+  const scope = z.enum(["project", "workspace", "organization"]).safeParse(requestedScope);
+  if (!scope.success) return c.json({ error: "Invalid sharing_scope" }, 400, corsHeaders);
+  if (scope.data === "project" && !project_id) {
+    return c.json({ error: "project_id is required for project-scoped shared memories" }, 400, corsHeaders);
+  }
+  if (scope.data !== "project" && project_id) {
+    return c.json({ error: "project_id must be omitted for workspace- or organization-scoped shared memories" }, 400, corsHeaders);
+  }
+
+  const rawIncludeUnconfirmed = c.req.query("include_unconfirmed");
+  if (rawIncludeUnconfirmed !== undefined && !["true", "false"].includes(rawIncludeUnconfirmed)) {
+    return c.json({ error: "include_unconfirmed must be true or false" }, 400, corsHeaders);
+  }
+  const includeUnconfirmed = rawIncludeUnconfirmed === "true";
+  const rawLimit = c.req.query("limit");
+  const limit = rawLimit === undefined ? 50 : Number(rawLimit);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+    return c.json({ error: "limit must be an integer from 1 to 100" }, 400, corsHeaders);
+  }
+
+  let query = supabase
+    .from("shared_agent_memories")
+    .select("id, workspace_id, project_id, sharing_scope, memory_type, summary, content, lifecycle_status, provenance_status, confidence, created_by_agent, can_use_as_instruction, can_use_as_evidence, requires_user_confirmation, review_status, created_at, updated_at")
+    .eq("workspace_id", workspace_id)
+    .eq("sharing_scope", scope.data)
+    .eq("lifecycle_status", "active")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (scope.data === "project") query = query.eq("project_id", project_id!);
+  else query = query.is("project_id", null);
+  if (includeUnconfirmed) query = query.in("review_status", ["pending", "confirmed", "evidence_only"]);
+  else query = query.in("review_status", ["confirmed", "evidence_only"]);
+
+  const { data, error } = await query;
+  if (error) return c.json({ error: error.message }, 500, corsHeaders);
+  const memories = (data || []).map((memory) => responseSharedMemory(memory as Record<string, unknown>));
+  return c.json({ memories, count: memories.length }, 200, corsHeaders);
+});
+
+app.post("/shared-memories", async (c) => {
+  const parsed = sharedMemorySchema.strict().safeParse(await c.req.json());
+  if (!parsed.success) return c.json({ error: "Invalid shared-memory payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  const req = parsed.data;
+  if (req.sharing_scope === "project" && !req.project_id) {
+    return c.json({ error: "project_id is required for project-scoped shared memories" }, 400, corsHeaders);
+  }
+  if (req.sharing_scope !== "project" && req.project_id) {
+    return c.json({ error: "project_id must be omitted for workspace- or organization-scoped shared memories" }, 400, corsHeaders);
+  }
+
+  const unsafe = [...unsafeReasons(req.summary), ...unsafeReasons(req.content)];
+  if (unsafe.length > 0) return c.json({ error: "Unsafe shared-memory write blocked", reasons: [...new Set(unsafe)] }, 422, corsHeaders);
+
+  const agentId = c.get("agentId");
+  const idempotencyKey = req.idempotency_key ? `${agentId}:${req.idempotency_key}` : null;
+  if (idempotencyKey) {
+    const { data: existing, error: existingError } = await supabase
+      .from("shared_agent_memories")
+      .select("*")
+      .eq("created_by_agent", agentId)
+      .eq("idempotency_key", idempotencyKey)
+      .maybeSingle();
+    if (existingError) return c.json({ error: existingError.message }, 500, corsHeaders);
+    if (existing) return c.json({ memory: responseSharedMemory(existing), deduplicated: true }, 200, corsHeaders);
+  }
+
+  const { data: memory, error } = await supabase.from("shared_agent_memories").insert({
+    workspace_id: req.workspace_id,
+    project_id: req.project_id ?? null,
+    sharing_scope: req.sharing_scope,
+    memory_type: req.memory_type,
+    summary: req.summary,
+    content: req.content,
+    provenance_status: req.provenance_status,
+    confidence: req.confidence,
+    created_by_agent: agentId,
+    can_use_as_instruction: false,
+    can_use_as_evidence: true,
+    requires_user_confirmation: true,
+    review_status: "pending",
+    lifecycle_status: "active",
+    idempotency_key: idempotencyKey,
+    metadata: { source: "agent-memory-api", authenticated_agent_id: agentId },
+  }).select("*").single();
+  if (error) {
+    if (idempotencyKey && error.code === "23505") {
+      const { data: existingAfterConflict, error: lookupError } = await supabase
+        .from("shared_agent_memories")
+        .select("*")
+        .eq("created_by_agent", agentId)
+        .eq("idempotency_key", idempotencyKey)
+        .maybeSingle();
+      if (!lookupError && existingAfterConflict) {
+        return c.json({ memory: responseSharedMemory(existingAfterConflict), deduplicated: true }, 200, corsHeaders);
+      }
+    }
+    return c.json({ error: error.message }, 500, corsHeaders);
+  }
+
+  await audit("memory_written", {
+    workspace_id: req.workspace_id,
+    project_id: req.project_id,
+    actor_kind: "agent",
+    actor_label: agentId,
+    shared_memory_id: memory.id,
+    sharing_scope: req.sharing_scope,
+    memory_type: req.memory_type,
+  });
+  return c.json({ memory: responseSharedMemory(memory), deduplicated: false }, 201, corsHeaders);
+});
+
 app.get("/memories/:id", async (c) => {
   const id = c.req.param("id");
   const { data, error } = await supabase.from("agent_memories").select("*, agent_memory_source_refs(*), agent_memory_artifacts(*)").eq("id", id).single();
@@ -634,23 +795,19 @@ app.patch("/memories/:id/review", async (c) => {
   const parsed = reviewSchema.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Invalid review payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
+  if (!["reject", "mark_stale", "dispute"].includes(req.action)) {
+    return c.json({ error: "Agent credentials cannot perform this review action; use user review for confirmation, evidence promotion, edits, and scope changes" }, 403, corsHeaders);
+  }
+  const agentId = c.get("agentId");
 
   const { data: before, error: beforeError } = await supabase.from("agent_memories").select("*").eq("id", id).single();
   if (beforeError) return c.json({ error: beforeError.message }, 404, corsHeaders);
+  if (before.metadata?.authenticated_agent_id !== agentId) {
+    return c.json({ error: "Agent credentials may only review memories created by the authenticated Agent" }, 403, corsHeaders);
+  }
 
   const updates: Record<string, unknown> = {};
-  if (req.action === "confirm") {
-    updates.review_status = "confirmed";
-    updates.provenance_status = "user_confirmed";
-    updates.can_use_as_instruction = true;
-    updates.requires_user_confirmation = false;
-    updates.last_confirmed_at = new Date().toISOString();
-  } else if (req.action === "evidence_only") {
-    updates.review_status = "evidence_only";
-    updates.can_use_as_instruction = false;
-    updates.can_use_as_evidence = true;
-    updates.requires_user_confirmation = false;
-  } else if (req.action === "reject") {
+  if (req.action === "reject") {
     updates.review_status = "rejected";
     updates.lifecycle_status = "rejected";
     updates.can_use_as_instruction = false;
@@ -663,12 +820,6 @@ app.patch("/memories/:id/review", async (c) => {
     updates.lifecycle_status = "disputed";
     updates.provenance_status = "disputed";
     updates.can_use_as_instruction = false;
-  } else if (req.action === "restrict_scope") {
-    updates.review_status = "restricted";
-    updates.visibility = req.visibility || "personal";
-  } else if (req.action === "edit") {
-    if (req.content) updates.content = req.content;
-    if (req.summary) updates.summary = req.summary;
   }
 
   const { data: after, error: updateError } = await supabase.from("agent_memories").update(updates).eq("id", id).select("*").single();
@@ -677,35 +828,23 @@ app.patch("/memories/:id/review", async (c) => {
   await supabase.from("agent_memory_review_actions").insert({
     memory_id: id,
     action: req.action,
-    actor_id: req.actor_id ?? null,
-    actor_label: req.actor_label ?? null,
+    actor_id: agentId,
+    actor_label: agentId,
     notes: req.notes ?? null,
     before,
     after,
   });
 
-  if (req.related_memory_id && ["merge", "supersede"].includes(req.action)) {
-    await supabase.from("agent_memory_relations").insert({
-      from_memory_id: id,
-      to_memory_id: req.related_memory_id,
-      relation: req.action === "merge" ? "merged_into" : "supersedes",
-      confidence: 1,
-    });
-  }
-
   const eventMap: Record<string, string> = {
-    confirm: "memory_confirmed",
-    edit: "memory_edited",
     reject: "memory_rejected",
-    supersede: "memory_superseded",
     dispute: "memory_disputed",
   };
   await audit(eventMap[req.action] || "memory_edited", {
     workspace_id: before.workspace_id,
     project_id: before.project_id,
     memory_id: id,
-    actor_kind: "user",
-    actor_label: req.actor_label,
+    actor_kind: "agent",
+    actor_label: agentId,
     action: req.action,
   });
 

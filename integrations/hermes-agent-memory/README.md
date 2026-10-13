@@ -12,7 +12,7 @@ Plugs Hermes Agent into the OB1 v1 Agent Memory API so every Hermes turn does th
 
 1. **Recall** — Before the LLM call, recent and relevant memories are pulled from OB1 (filtered by `use_policy` — `[instruction]` items are treated as binding rules, `[evidence]` as supporting context only).
 2. **Writeback** — After the turn, a structured summary lands in `agent_memories` tagged with `runtime=hermes`, the actual model + provider that ran the turn, and the `task_id` linkage.
-3. **Govern** — Memories default to `pending_review` with `requires_user_confirmation=true` so nothing is promoted to instruction-grade until a human (or the `ob1_review_memory` tool) confirms it.
+3. **Govern** — Memories default to `pending_review` with `requires_user_confirmation=true`; only user review can confirm, edit, or promote a memory.
 
 The same backend serves both runtimes — OpenClaw agents and Hermes agents share **one** governed memory.
 
@@ -32,7 +32,7 @@ HERMES AGENT MEMORY -- CREDENTIAL TRACKER
 
 FROM OB1
   Agent Memory API URL:   ____________
-  MCP Access Key:         ____________
+  Per-Agent bearer token: ____________
 
 HERMES
   Plugin path (~/.hermes/plugins/ob1):  ____________
@@ -70,7 +70,7 @@ cp plugin/plugin.yaml     ~/.hermes/plugins/ob1/plugin.yaml
 
 ![Step 3](https://img.shields.io/badge/Step_3-Configure_Hermes-1E88E5?style=for-the-badge)
 
-The plugin reads non-secret config from `~/.hermes/ob1.json` and the access key from the `OPENBRAIN_KEY` environment variable.
+The plugin reads non-secret config from `~/.hermes/ob1.json` and this Agent's unique bearer token from the `OPENBRAIN_KEY` environment variable.
 
 **1. Write the config file:**
 
@@ -89,10 +89,10 @@ cat > ~/.hermes/ob1.json <<'EOF'
 EOF
 ```
 
-**2. Set the access key in `~/.hermes/.env`:**
+**2. Set this Agent's bearer token in `~/.hermes/.env`:**
 
 ```bash
-echo 'OPENBRAIN_KEY=<your-mcp-access-key>' >> ~/.hermes/.env
+echo 'OPENBRAIN_KEY=<your-per-agent-bearer-token>' >> ~/.hermes/.env
 echo 'OPENBRAIN_URL=http://localhost:8000/functions/v1/agent-memory-api' >> ~/.hermes/.env
 ```
 

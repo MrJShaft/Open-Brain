@@ -253,7 +253,7 @@ openclaw plugins install clawhub:@natebjones/ob1-agent-memory
 
 - Plugin manifest validates.
 - Plugin manifest declares `contracts.tools` for every `openbrain_*` tool. OpenClaw rejects tool registration without the manifest contract.
-- Plugin config accepts `endpoint`, `workspaceId`, and `accessKey`. Prefer an OpenClaw SecretRef backed by a file or exec provider so the access key does not live in plaintext config.
+- Plugin config accepts `endpoint`, `workspaceId`, and this Agent's unique bearer token in `accessKey`. Prefer an OpenClaw SecretRef backed by a file or exec provider so the token does not live in plaintext config.
 - Tool entry uses `definePluginEntry`, `typebox` parameters, `label`, `execute(_id, params)`, and returns `details`.
 - Package includes compiled runtime output at `plugin/dist/index.js`; ClawHub rejects TypeScript-only plugin entrypoints.
 - Local linked install is tested in an isolated profile with `openclaw --profile ob1-agent-memory plugins install integrations/openclaw-agent-memory/plugin --link`.

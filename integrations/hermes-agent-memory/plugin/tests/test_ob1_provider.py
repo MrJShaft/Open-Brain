@@ -372,16 +372,15 @@ class TestOB1Client:
         assert body["query"] == "hello"
         assert body["scope"]["project_only"] is True
 
-    def test_recall_uses_x_brain_key_header(self):
+    def test_recall_uses_agent_bearer_token(self):
         captured, fake = self._capture_request()
         client = _OB1Client("http://x", "secret-key", 5.0)
         with patch("urllib.request.urlopen", fake):
             client.recall(workspace_id="w", project_id=None, task_type="t", query="q")
         # urllib lowercases header keys in header_items()
         headers_lc = {k.lower(): v for k, v in captured["headers"].items()}
-        assert headers_lc.get("x-brain-key") == "secret-key"
-        # Critical: must NOT use Authorization Bearer
-        assert "authorization" not in headers_lc
+        assert headers_lc.get("authorization") == "Bearer secret-key"
+        assert "x-brain-key" not in headers_lc
 
     def test_writeback_payload_shape(self):
         captured, fake = self._capture_request()

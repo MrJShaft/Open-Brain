@@ -41,9 +41,9 @@ SUPABASE (from your Open Brain setup)
 
 ![Step 1](https://img.shields.io/badge/Step_1-Run_the_Agent_Memory_Schema-1E88E5?style=for-the-badge)
 
-Open Supabase SQL Editor, paste the contents of [`schema.sql`](./schema.sql), and run it.
+Open Supabase SQL Editor, paste and run [`schema.sql`](./schema.sql), then paste and run [`shared-memories.sql`](./shared-memories.sql).
 
-**Done when:** Table Editor shows `agent_memories`, `agent_memory_recall_traces`, `agent_memory_recall_items`, and `agent_memory_audit_events`.
+**Done when:** Table Editor shows the core `agent_memories` and trace/audit tables plus `shared_agent_memories`.
 
 ![Step 2](https://img.shields.io/badge/Step_2-Verify_the_Trust_Defaults-1E88E5?style=for-the-badge)
 
@@ -61,7 +61,23 @@ WHERE table_name = 'agent_memories'
   );
 ```
 
-**Done when:** instruction defaults to `false`, evidence defaults to `true`, confirmation defaults to `true`, and review defaults to `pending`.
+Also verify the shared table grants and RLS flag:
+
+```sql
+SELECT grantee, privilege_type
+FROM information_schema.role_table_grants
+WHERE table_schema = 'public'
+  AND table_name = 'shared_agent_memories'
+  AND grantee IN ('anon', 'authenticated', 'service_role')
+ORDER BY grantee, privilege_type;
+
+SELECT c.relrowsecurity
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relname = 'shared_agent_memories';
+```
+
+**Done when:** memory instruction defaults to `false`, evidence defaults to `true`, confirmation defaults to `true`, review defaults to `pending`, and the shared-memory table grants access only to `service_role` with RLS enabled.
 
 ![Step 3](https://img.shields.io/badge/Step_3-Install_the_API-1E88E5?style=for-the-badge)
 
@@ -71,7 +87,7 @@ Deploy the runtime API from [`../../integrations/agent-memory-api/`](../../integ
 
 ## Expected Outcome
 
-After applying this schema, OB1 can store agent memories as governed records instead of raw transcript dumps. Agent-written memories start as evidence-only pending review. Only `user_confirmed` or trusted `imported` memories can become instruction-grade.
+After applying both schemas, OB1 can store agent memories and explicitly scoped shared memories as governed records instead of raw transcript dumps. Agent-written memories start pending and evidence-only; only `user_confirmed` or trusted `imported` memories can become instruction-grade.
 
 Use [Safe Agent Memory and Provenance](../../docs/safe-agent-memory-provenance.md) as the operating guide for provenance, review status, use policy, and scope decisions.
 

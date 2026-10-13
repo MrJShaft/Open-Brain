@@ -25,7 +25,7 @@
         "description": "Base URL for the OB1 Agent Memory API, without a trailing slash."
       },
       "accessKey": {
-        "description": "OB1 Agent Memory access key. Prefer an OpenClaw SecretRef so the key does not live in plaintext config.",
+        "description": "Unique bearer token assigned to this Agent for OB1 Agent Memory. Prefer an OpenClaw SecretRef so the token does not live in plaintext config.",
         "anyOf": [
           {
             "type": "string"

@@ -1,10 +1,7 @@
 #!/usr/bin/env node
 
 const endpoint = requiredEnv("OB1_AGENT_MEMORY_ENDPOINT").replace(/\/$/, "");
-const accessKey = process.env.OB1_AGENT_MEMORY_KEY || process.env.MCP_ACCESS_KEY;
-if (!accessKey) {
-  fail("Set OB1_AGENT_MEMORY_KEY or MCP_ACCESS_KEY.");
-}
+const accessKey = requiredEnv("OB1_AGENT_MEMORY_KEY");
 
 const workspaceId = process.env.OB1_AGENT_MEMORY_WORKSPACE_ID || "ob1-staging";
 const projectId = process.env.OB1_AGENT_MEMORY_PROJECT_ID || "agent-memory-api-smoke";
@@ -20,9 +17,32 @@ const summary = {
 };
 
 async function main() {
+  const anonymousHealth = await fetch(`${endpoint}/health`);
+  assert(anonymousHealth.status === 401, `anonymous health check should return 401, got ${anonymousHealth.status}`);
+  const legacyAuth = await fetch(`${endpoint}/health?key=legacy-test-key`, {
+    headers: { "x-brain-key": "legacy-test-key" },
+  });
+  assert(legacyAuth.status === 401, `legacy shared-key auth should return 401, got ${legacyAuth.status}`);
+  summary.checks.agent_authentication = "passed";
+
   const health = await request("/health");
   assert(health.ok === true, "health did not return ok=true");
   summary.checks.health = "passed";
+
+  const sharedMemoryParams = new URLSearchParams({
+    workspace_id: workspaceId,
+    project_id: projectId,
+    sharing_scope: "project",
+    limit: "10",
+  });
+  const sharedMemoryList = await request(`/shared-memories?${sharedMemoryParams}`);
+  assert(Array.isArray(sharedMemoryList.memories), "shared-memory list did not return a memories array");
+  const invalidSharedScope = await request(`/shared-memories?${new URLSearchParams({
+    workspace_id: workspaceId,
+    sharing_scope: "project",
+  })}`, { expectedStatus: 400 });
+  assert(invalidSharedScope.error?.includes("project_id"), "project-scoped shared-memory read did not require project_id");
+  summary.checks.shared_memory_scope = { status: "passed", returned_count: sharedMemoryList.count };
 
   const writeback = await request("/writeback", {
     method: "POST",
@@ -30,6 +50,7 @@ async function main() {
   });
   const writtenIds = (writeback.memories || []).map((memory) => memory.memory_id);
   assert(writtenIds.length >= 3, `expected at least 3 written memories, got ${writtenIds.length}`);
+  assert(writeback.memories.every((memory) => memory.provenance?.status === "generated"), "Agent forged imported or user-confirmed provenance");
   assert(writeback.memories.every((memory) => memory.use_policy?.can_use_as_instruction === false), "generated writeback became instruction-grade");
   assert(writeback.memories.every((memory) => memory.use_policy?.can_use_as_evidence === true), "generated writeback was not evidence-enabled");
   assert(writeback.memories.every((memory) => memory.use_policy?.requires_user_confirmation === true), "generated writeback did not require review");
@@ -81,20 +102,24 @@ async function main() {
   });
   summary.checks.usage_reporting = "passed";
 
-  const reviewed = await request(`/memories/${writtenIds[0]}/review`, {
+  const deniedReview = await request(`/memories/${writtenIds[0]}/review`, {
     method: "PATCH",
     body: {
-      action: "evidence_only",
+      action: "confirm",
       actor_label: "OB1 Agent Memory API live smoke",
       notes: `API smoke run ${runId}`,
     },
+    expectedStatus: 403,
   });
-  assert(reviewed.memory?.review_status === "evidence_only", "review action did not set evidence_only");
-  assert(reviewed.memory?.can_use_as_instruction === false, "evidence_only memory became instruction-grade");
-  summary.checks.review_action = {
+  assert(deniedReview.error?.includes("user review"), "Agent credential was not denied user review action");
+  const reviewState = await request(`/memories/${writtenIds[0]}`);
+  assert(reviewState.memory?.review_status === "pending", "Agent review denial changed the pending review state");
+  assert(reviewState.memory?.can_use_as_instruction === false, "Agent review denial made memory instruction-grade");
+  assert(reviewState.memory?.requires_user_confirmation === true, "Agent review denial removed user confirmation requirement");
+  summary.checks.agent_review_restriction = {
     status: "passed",
-    reviewed_memory_id: writtenIds[0],
-    review_status_after: reviewed.memory.review_status,
+    denied_action: "confirm",
+    review_status_after: reviewState.memory.review_status,
   };
 
   const inspected = await request(`/memories/${writtenIds[0]}`);
@@ -156,7 +181,7 @@ function writebackPayload() {
         repos: ["OB1"],
       },
     },
-    provenance: { default_status: "generated", confidence: 0.83, requires_review: true },
+    provenance: { default_status: "imported", confidence: 0.83, requires_review: false },
     retention: { stale_after_days: 30 },
     visibility: { workspace: "private", project: "project", channel: "cli" },
   };
@@ -208,7 +233,7 @@ async function request(path, options = {}) {
     method: options.method || "GET",
     headers: {
       "content-type": "application/json",
-      "x-brain-key": accessKey,
+      authorization: `Bearer ${accessKey}`,
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });

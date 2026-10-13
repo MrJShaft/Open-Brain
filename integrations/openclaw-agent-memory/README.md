@@ -98,7 +98,7 @@ Review [Safe Agent Memory and Provenance](../../docs/safe-agent-memory-provenanc
 ## Troubleshooting
 
 **Issue: Plugin loads but tools fail auth**
-Solution: Confirm the plugin config has the correct `endpoint` and `accessKey`. Prefer an OpenClaw SecretRef backed by a file, env, or exec provider so the access key does not live in plaintext config.
+Solution: Confirm the plugin config has the correct `endpoint` and this Agent's unique bearer token in `accessKey`. Prefer an OpenClaw SecretRef backed by a file, env, or exec provider so the token does not live in plaintext config.
 
 **Issue: Plugin loads but lists no tools**
 Solution: Confirm [`plugin/openclaw.plugin.json`](./plugin/openclaw.plugin.json) declares `contracts.tools` for every registered tool. Current OpenClaw builds reject tool registration without that manifest contract.

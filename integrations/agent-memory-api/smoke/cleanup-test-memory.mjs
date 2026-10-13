@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 
 const endpoint = requiredEnv("OB1_AGENT_MEMORY_ENDPOINT").replace(/\/$/, "");
-const accessKey = process.env.OB1_AGENT_MEMORY_KEY || process.env.MCP_ACCESS_KEY;
-if (!accessKey) fail("Set OB1_AGENT_MEMORY_KEY or MCP_ACCESS_KEY.");
+const accessKey = requiredEnv("OB1_AGENT_MEMORY_KEY");
 
 const workspaceId = process.env.OB1_AGENT_MEMORY_WORKSPACE_ID || "ob1-staging";
 const projectIds = (process.env.OB1_AGENT_MEMORY_TEST_PROJECT_IDS || "agent-memory-api-smoke,agent-memory-openclaw-smoke")
@@ -65,7 +64,7 @@ async function request(path, options = {}) {
     method: options.method || "GET",
     headers: {
       "content-type": "application/json",
-      "x-brain-key": accessKey,
+      authorization: `Bearer ${accessKey}`,
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
