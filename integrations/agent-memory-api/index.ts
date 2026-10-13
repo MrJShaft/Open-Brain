@@ -3,12 +3,18 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { Hono } from "hono";
 import { createClient } from "@supabase/supabase-js";
 import { z } from "zod";
-import { authenticateAgent, parseAgentKeyHashes } from "./auth.js";
+import {
+  authenticateAgent,
+  isWorkspaceAllowed,
+  ownsPersonalMemory,
+  ownsRecallTrace,
+  parseAgentCredentials,
+} from "./auth.js";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
-const AGENT_API_KEY_HASHES = parseAgentKeyHashes(Deno.env.get("AGENT_API_KEY_HASHES_JSON") ?? "");
+const AGENT_API_CREDENTIALS = parseAgentCredentials(Deno.env.get("AGENT_API_CREDENTIALS_JSON") ?? "");
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -151,7 +157,7 @@ const sharedMemorySchema = z.object({
   idempotency_key: z.string().min(1).max(180).nullable().optional(),
 });
 
-type AppEnv = { Variables: { agentId: string } };
+type AppEnv = { Variables: { agentId: string; workspaceIds: string[] } };
 
 type AgentMemory = {
   id: string;
@@ -366,18 +372,23 @@ const app = new Hono<AppEnv>();
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
 
 app.use("*", async (c, next) => {
-  const agentId = await authenticateAgent(c.req.header("authorization"), AGENT_API_KEY_HASHES);
-  if (!agentId) return c.json({ error: "Invalid or missing Agent bearer token" }, 401, corsHeaders);
-  c.set("agentId", agentId);
+  const agent = await authenticateAgent(c.req.header("authorization"), AGENT_API_CREDENTIALS);
+  if (!agent) return c.json({ error: "Invalid or missing Agent bearer token" }, 401, corsHeaders);
+  c.set("agentId", agent.agentId);
+  c.set("workspaceIds", agent.workspaceIds);
   await next();
 });
 
-app.get("/health", (c) => c.json({ ok: true, service: "agent-memory-api", version: "0.2.0" }, 200, corsHeaders));
+app.get("/health", (c) => c.json({ ok: true, service: "agent-memory-api", version: "0.3.0" }, 200, corsHeaders));
 
 app.post("/recall", async (c) => {
   const parsed = recallSchema.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Invalid recall payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
+  if (!isWorkspaceAllowed(agent.workspaceIds, req.workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
 
   const embedding = await getEmbedding(req.query);
   const { data: matches, error: matchError } = await supabase.rpc("match_thoughts", {
@@ -396,6 +407,7 @@ app.post("/recall", async (c) => {
     .from("agent_memories")
     .select("*")
     .eq("workspace_id", req.workspace_id)
+    .eq("metadata->>authenticated_agent_id", agent.agentId)
     .order("created_at", { ascending: false })
     .limit(100);
   if (thoughtIds.length > 0) memoryQuery = memoryQuery.in("thought_id", thoughtIds);
@@ -404,7 +416,7 @@ app.post("/recall", async (c) => {
   if (memoryError) return c.json({ error: memoryError.message }, 500, corsHeaders);
 
   const ranked = ((rawMemories || []) as AgentMemory[])
-    .filter((m) => scopeMatches(m, req))
+    .filter((m) => ownsPersonalMemory(agent, m.workspace_id, m.metadata) && scopeMatches(m, req))
     .map((m) => {
       const similarity = similarityByThought.get(m.thought_id || "") || 0;
       return { ...m, similarity, ranking_score: rankMemory(m, similarity) };
@@ -423,7 +435,7 @@ app.post("/recall", async (c) => {
     channel_id: req.channel.id ?? null,
     query: req.query,
     schema_version: req.schema_version,
-    request_payload: req,
+    request_payload: { ...req, authenticated_agent_id: agent.agentId },
     response_policy: { max_items: req.limits.max_items, include_unconfirmed: req.scope.include_unconfirmed },
   }).select("*").single();
   if (traceError) return c.json({ error: traceError.message }, 500, corsHeaders);
@@ -464,6 +476,9 @@ app.post("/writeback", async (c) => {
   if (!parsed.success) return c.json({ error: "Invalid write-back payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
   const authenticatedAgentId = c.get("agentId");
+  if (!isWorkspaceAllowed(c.get("workspaceIds"), req.workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
   const rows = memoryRows(req);
   if (rows.length === 0) return c.json({ error: "memory_payload produced no memory rows" }, 400, corsHeaders);
 
@@ -491,12 +506,14 @@ app.post("/writeback", async (c) => {
   for (const [index, row] of rows.entries()) {
     const content_hash = await sha256Hex(`${row.memory_type}:${row.content}`);
     const baseKey = req.idempotency_key || `${req.workspace_id}:${req.runtime.name}:${req.task_id || "taskless"}:${req.step_id || "step"}:${content_hash}`;
-    const idempotency_key = `${baseKey}:${index}`;
+    const idempotency_key = await sha256Hex(`${authenticatedAgentId}:${req.workspace_id}:${baseKey}:${index}`);
 
     const { data: existing } = await supabase
       .from("agent_memories")
       .select("*")
       .eq("idempotency_key", idempotency_key)
+      .eq("workspace_id", req.workspace_id)
+      .eq("metadata->>authenticated_agent_id", authenticatedAgentId)
       .maybeSingle();
     if (existing) {
       created.push(existing);
@@ -606,11 +623,46 @@ app.post("/writeback", async (c) => {
 
 app.post("/recall/:request_id/usage", async (c) => {
   const request_id = c.req.param("request_id");
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
   const parsed = usageSchema.safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Invalid usage payload", details: parsed.error.flatten() }, 400, corsHeaders);
 
-  const { data: trace, error } = await supabase.from("agent_memory_recall_traces").select("*").eq("request_id", request_id).single();
-  if (error) return c.json({ error: error.message }, 404, corsHeaders);
+  const { data: trace, error } = await supabase
+    .from("agent_memory_recall_traces")
+    .select("*")
+    .eq("request_id", request_id)
+    .eq("request_payload->>authenticated_agent_id", agent.agentId)
+    .maybeSingle();
+  if (error || !trace || !ownsRecallTrace(agent, trace)) {
+    return c.json({ error: "Recall trace not found" }, 404, corsHeaders);
+  }
+
+  const { data: traceItems, error: traceItemsError } = await supabase
+    .from("agent_memory_recall_items")
+    .select("memory_id")
+    .eq("trace_id", trace.id);
+  if (traceItemsError) return c.json({ error: traceItemsError.message }, 500, corsHeaders);
+  const candidateMemoryIds = [...new Set((traceItems || []).map((item) => item.memory_id))];
+  let traceMemoryIds = new Set<string>();
+  if (candidateMemoryIds.length > 0) {
+    const { data: ownedTraceMemories, error: ownedMemoriesError } = await supabase
+      .from("agent_memories")
+      .select("id, workspace_id, metadata")
+      .in("id", candidateMemoryIds)
+      .eq("workspace_id", trace.workspace_id)
+      .eq("metadata->>authenticated_agent_id", agent.agentId);
+    if (ownedMemoriesError) return c.json({ error: ownedMemoriesError.message }, 500, corsHeaders);
+    traceMemoryIds = new Set((ownedTraceMemories || [])
+      .filter((memory) => ownsPersonalMemory(agent, memory.workspace_id, memory.metadata))
+      .map((memory) => memory.id));
+  }
+  const reportedMemoryIds = new Set([
+    ...parsed.data.used_memory_ids,
+    ...parsed.data.ignored.map((item) => item.memory_id),
+  ]);
+  if ([...reportedMemoryIds].some((memoryId) => !traceMemoryIds.has(memoryId))) {
+    return c.json({ error: "Usage can only be reported for memories in this Agent's recall trace" }, 400, corsHeaders);
+  }
 
   for (const memory_id of parsed.data.used_memory_ids) {
     await supabase.from("agent_memory_recall_items").update({ used: true }).eq("trace_id", trace.id).eq("memory_id", memory_id);
@@ -627,23 +679,35 @@ app.post("/recall/:request_id/usage", async (c) => {
 app.get("/memories/review", async (c) => {
   const workspace_id = c.req.query("workspace_id");
   if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
+  if (!isWorkspaceAllowed(agent.workspaceIds, workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
   const project_id = c.req.query("project_id");
-  let q = supabase.from("agent_memories").select("*").eq("workspace_id", workspace_id).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
+  let q = supabase.from("agent_memories").select("*").eq("workspace_id", workspace_id).eq("metadata->>authenticated_agent_id", agent.agentId).eq("review_status", "pending").order("created_at", { ascending: false }).limit(100);
   if (project_id) q = q.eq("project_id", project_id);
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
-  return c.json({ memories: (data || []).map(responseMemory) }, 200, corsHeaders);
+  const memories = ((data || []) as AgentMemory[])
+    .filter((memory) => ownsPersonalMemory(agent, memory.workspace_id, memory.metadata))
+    .map(responseMemory);
+  return c.json({ memories }, 200, corsHeaders);
 });
 
 app.get("/memories", async (c) => {
   const workspace_id = c.req.query("workspace_id");
   if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
+  if (!isWorkspaceAllowed(agent.workspaceIds, workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
 
   const limit = Math.min(Math.max(parseInt(c.req.query("limit") || "50", 10), 1), 200);
   let q = supabase
     .from("agent_memories")
     .select("*")
     .eq("workspace_id", workspace_id)
+    .eq("metadata->>authenticated_agent_id", agent.agentId)
     .order("created_at", { ascending: false })
     .limit(limit);
 
@@ -663,12 +727,18 @@ app.get("/memories", async (c) => {
 
   const { data, error } = await q;
   if (error) return c.json({ error: error.message }, 500, corsHeaders);
-  return c.json({ memories: (data || []).map(responseMemory), count: data?.length || 0 }, 200, corsHeaders);
+  const memories = ((data || []) as AgentMemory[])
+    .filter((memory) => ownsPersonalMemory(agent, memory.workspace_id, memory.metadata))
+    .map(responseMemory);
+  return c.json({ memories, count: memories.length }, 200, corsHeaders);
 });
 
 app.get("/shared-memories", async (c) => {
   const workspace_id = c.req.query("workspace_id");
   if (!workspace_id) return c.json({ error: "workspace_id is required" }, 400, corsHeaders);
+  if (!isWorkspaceAllowed(c.get("workspaceIds"), workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
 
   const project_id = c.req.query("project_id");
   const requestedScope = c.req.query("sharing_scope") || (project_id ? "project" : "workspace");
@@ -715,6 +785,9 @@ app.post("/shared-memories", async (c) => {
   const parsed = sharedMemorySchema.strict().safeParse(await c.req.json());
   if (!parsed.success) return c.json({ error: "Invalid shared-memory payload", details: parsed.error.flatten() }, 400, corsHeaders);
   const req = parsed.data;
+  if (!isWorkspaceAllowed(c.get("workspaceIds"), req.workspace_id)) {
+    return c.json({ error: "workspace_id is not authorized for this Agent" }, 403, corsHeaders);
+  }
   if (req.sharing_scope === "project" && !req.project_id) {
     return c.json({ error: "project_id is required for project-scoped shared memories" }, 400, corsHeaders);
   }
@@ -785,8 +858,16 @@ app.post("/shared-memories", async (c) => {
 
 app.get("/memories/:id", async (c) => {
   const id = c.req.param("id");
-  const { data, error } = await supabase.from("agent_memories").select("*, agent_memory_source_refs(*), agent_memory_artifacts(*)").eq("id", id).single();
-  if (error) return c.json({ error: error.message }, 404, corsHeaders);
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
+  const { data, error } = await supabase
+    .from("agent_memories")
+    .select("*, agent_memory_source_refs(*), agent_memory_artifacts(*)")
+    .eq("id", id)
+    .eq("metadata->>authenticated_agent_id", agent.agentId)
+    .maybeSingle();
+  if (error || !data || !ownsPersonalMemory(agent, data.workspace_id, data.metadata)) {
+    return c.json({ error: "Memory not found" }, 404, corsHeaders);
+  }
   return c.json({ memory: data }, 200, corsHeaders);
 });
 
@@ -798,12 +879,16 @@ app.patch("/memories/:id/review", async (c) => {
   if (!["reject", "mark_stale", "dispute"].includes(req.action)) {
     return c.json({ error: "Agent credentials cannot perform this review action; use user review for confirmation, evidence promotion, edits, and scope changes" }, 403, corsHeaders);
   }
-  const agentId = c.get("agentId");
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
 
-  const { data: before, error: beforeError } = await supabase.from("agent_memories").select("*").eq("id", id).single();
-  if (beforeError) return c.json({ error: beforeError.message }, 404, corsHeaders);
-  if (before.metadata?.authenticated_agent_id !== agentId) {
-    return c.json({ error: "Agent credentials may only review memories created by the authenticated Agent" }, 403, corsHeaders);
+  const { data: before, error: beforeError } = await supabase
+    .from("agent_memories")
+    .select("*")
+    .eq("id", id)
+    .eq("metadata->>authenticated_agent_id", agent.agentId)
+    .maybeSingle();
+  if (beforeError || !before || !ownsPersonalMemory(agent, before.workspace_id, before.metadata)) {
+    return c.json({ error: "Memory not found" }, 404, corsHeaders);
   }
 
   const updates: Record<string, unknown> = {};
@@ -822,14 +907,21 @@ app.patch("/memories/:id/review", async (c) => {
     updates.can_use_as_instruction = false;
   }
 
-  const { data: after, error: updateError } = await supabase.from("agent_memories").update(updates).eq("id", id).select("*").single();
+  const { data: after, error: updateError } = await supabase
+    .from("agent_memories")
+    .update(updates)
+    .eq("id", id)
+    .eq("workspace_id", before.workspace_id)
+    .eq("metadata->>authenticated_agent_id", agent.agentId)
+    .select("*")
+    .single();
   if (updateError) return c.json({ error: updateError.message }, 500, corsHeaders);
 
   await supabase.from("agent_memory_review_actions").insert({
     memory_id: id,
     action: req.action,
-    actor_id: agentId,
-    actor_label: agentId,
+    actor_id: agent.agentId,
+    actor_label: agent.agentId,
     notes: req.notes ?? null,
     before,
     after,
@@ -844,7 +936,7 @@ app.patch("/memories/:id/review", async (c) => {
     project_id: before.project_id,
     memory_id: id,
     actor_kind: "agent",
-    actor_label: agentId,
+    actor_label: agent.agentId,
     action: req.action,
   });
 
@@ -853,11 +945,23 @@ app.patch("/memories/:id/review", async (c) => {
 
 app.get("/recall-traces/:request_id", async (c) => {
   const request_id = c.req.param("request_id");
-  const { data: trace, error } = await supabase.from("agent_memory_recall_traces").select("*").eq("request_id", request_id).single();
-  if (error) return c.json({ error: error.message }, 404, corsHeaders);
+  const agent = { agentId: c.get("agentId"), workspaceIds: c.get("workspaceIds") };
+  const { data: trace, error } = await supabase
+    .from("agent_memory_recall_traces")
+    .select("*")
+    .eq("request_id", request_id)
+    .eq("request_payload->>authenticated_agent_id", agent.agentId)
+    .maybeSingle();
+  if (error || !trace || !ownsRecallTrace(agent, trace)) {
+    return c.json({ error: "Recall trace not found" }, 404, corsHeaders);
+  }
   const { data: items, error: itemError } = await supabase.from("agent_memory_recall_items").select("*, agent_memories(*)").eq("trace_id", trace.id).order("rank");
   if (itemError) return c.json({ error: itemError.message }, 500, corsHeaders);
-  return c.json({ trace, items }, 200, corsHeaders);
+  const ownedItems = (items || []).filter((item) => {
+    const memory = item.agent_memories as unknown as AgentMemory | null;
+    return Boolean(memory && ownsPersonalMemory(agent, memory.workspace_id, memory.metadata));
+  });
+  return c.json({ trace, items: ownedItems }, 200, corsHeaders);
 });
 
 Deno.serve((req) => {

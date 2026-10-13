@@ -4,6 +4,7 @@ const endpoint = requiredEnv("OB1_AGENT_MEMORY_ENDPOINT").replace(/\/$/, "");
 const accessKey = requiredEnv("OB1_AGENT_MEMORY_KEY");
 
 const workspaceId = process.env.OB1_AGENT_MEMORY_WORKSPACE_ID || "ob1-staging";
+const deniedWorkspaceId = process.env.OB1_AGENT_MEMORY_DENIED_WORKSPACE_ID || `${workspaceId}-not-authorized`;
 const projectId = process.env.OB1_AGENT_MEMORY_PROJECT_ID || "agent-memory-api-smoke";
 const runId = process.env.OB1_AGENT_MEMORY_RUN_ID || new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
 const taskId = `agent-memory-api-smoke-${runId}`;
@@ -17,6 +18,7 @@ const summary = {
 };
 
 async function main() {
+  assert(deniedWorkspaceId !== workspaceId, "denied workspace must differ from the authorized workspace");
   const anonymousHealth = await fetch(`${endpoint}/health`);
   assert(anonymousHealth.status === 401, `anonymous health check should return 401, got ${anonymousHealth.status}`);
   const legacyAuth = await fetch(`${endpoint}/health?key=legacy-test-key`, {
@@ -28,6 +30,25 @@ async function main() {
   const health = await request("/health");
   assert(health.ok === true, "health did not return ok=true");
   summary.checks.health = "passed";
+
+  const deniedWorkspaceQuery = new URLSearchParams({ workspace_id: deniedWorkspaceId });
+  const deniedMemoryList = await request(`/memories?${deniedWorkspaceQuery}`, { expectedStatus: 403 });
+  const deniedReviewQueue = await request(`/memories/review?${deniedWorkspaceQuery}`, { expectedStatus: 403 });
+  const deniedSharedRead = await request(`/shared-memories?${new URLSearchParams({ workspace_id: deniedWorkspaceId })}`, { expectedStatus: 403 });
+  const deniedRecall = await request("/recall", {
+    method: "POST",
+    body: { ...recallPayload(true), workspace_id: deniedWorkspaceId },
+    expectedStatus: 403,
+  });
+  const deniedWriteback = await request("/writeback", {
+    method: "POST",
+    body: { ...writebackPayload(), workspace_id: deniedWorkspaceId },
+    expectedStatus: 403,
+  });
+  for (const result of [deniedMemoryList, deniedReviewQueue, deniedSharedRead, deniedRecall, deniedWriteback]) {
+    assert(result.error?.includes("not authorized"), "cross-workspace request did not report the allowlist denial");
+  }
+  summary.checks.workspace_isolation = { status: "passed", denied_workspace_id: deniedWorkspaceId };
 
   const sharedMemoryParams = new URLSearchParams({
     workspace_id: workspaceId,
