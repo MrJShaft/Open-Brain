@@ -1,5 +1,5 @@
 // src/index.ts
-import { Type as Type2 } from "typebox";
+import { Type } from "typebox";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveConfiguredSecretInputString } from "openclaw/plugin-sdk/secret-input-runtime";
 
@@ -28,7 +28,7 @@ var AgentMemoryClient = class {
       method: options.method || "GET",
       headers: {
         "content-type": "application/json",
-        "x-brain-key": this.accessKey
+        authorization: `Bearer ${this.accessKey}`
       },
       body: options.body === void 0 ? void 0 : JSON.stringify(options.body)
     });
@@ -95,120 +95,6 @@ var AgentMemoryClient = class {
     return this.request(`/recall-traces/${requestId}`);
   }
 };
-
-// src/tool-schemas.js
-import { Type } from "typebox";
-var schemaVersion = (value) => Type.Optional(Type.Literal(value));
-var nullableString = () => Type.Union([Type.String(), Type.Null()]);
-var optionalNullableString = () => Type.Optional(nullableString());
-var optionalStringArray = () => Type.Optional(Type.Array(Type.String()));
-var optionalNullableInteger = () => Type.Optional(Type.Union([Type.Integer({ minimum: 1 }), Type.Null()]));
-var channelSchema = Type.Object({
-  kind: Type.Optional(Type.String()),
-  id: optionalNullableString(),
-  thread_id: optionalNullableString()
-});
-var runtimeSchema = Type.Object({
-  name: Type.Optional(Type.String()),
-  version: optionalNullableString()
-});
-var entitiesSchema = Type.Object({
-  people: optionalStringArray(),
-  orgs: optionalStringArray(),
-  repos: optionalStringArray(),
-  files: optionalStringArray(),
-  customers: optionalStringArray(),
-  topics: optionalStringArray()
-});
-var recallParameters = Type.Object({
-  schema_version: schemaVersion("openbrain.openclaw.recall.v1"),
-  project_id: optionalNullableString(),
-  task_id: optionalNullableString(),
-  flow_id: optionalNullableString(),
-  task_type: optionalNullableString(),
-  channel: Type.Optional(channelSchema),
-  runtime: Type.Optional(runtimeSchema),
-  model_intent: Type.Optional(Type.Object({
-    provider: optionalNullableString(),
-    model: optionalNullableString()
-  })),
-  query: Type.String(),
-  entities: Type.Optional(entitiesSchema),
-  scope: Type.Optional(Type.Object({
-    visibility: optionalNullableString(),
-    project_only: Type.Optional(Type.Boolean()),
-    include_unconfirmed: Type.Optional(Type.Boolean()),
-    include_stale: Type.Optional(Type.Boolean())
-  })),
-  limits: Type.Optional(Type.Object({
-    max_items: Type.Optional(Type.Integer({ minimum: 1, maximum: 50 })),
-    max_tokens: Type.Optional(Type.Integer({ minimum: 256, maximum: 2e4 })),
-    recency_days: optionalNullableInteger()
-  })),
-  sensitivity: Type.Optional(Type.Object({
-    contains_code: Type.Optional(Type.Boolean()),
-    contains_customer_data: Type.Optional(Type.Boolean()),
-    contains_private_meeting_data: Type.Optional(Type.Boolean())
-  }))
-});
-var memoryPayloadSchema = Type.Object({
-  decisions: optionalStringArray(),
-  outputs: optionalStringArray(),
-  lessons: optionalStringArray(),
-  constraints: optionalStringArray(),
-  unresolved_questions: optionalStringArray(),
-  next_steps: optionalStringArray(),
-  failures: optionalStringArray(),
-  artifacts: Type.Optional(Type.Array(Type.Object({
-    kind: Type.String(),
-    uri: Type.String(),
-    description: optionalNullableString()
-  }))),
-  entities: Type.Optional(entitiesSchema)
-});
-var writebackParameters = Type.Object({
-  schema_version: schemaVersion("openbrain.openclaw.writeback.v1"),
-  project_id: optionalNullableString(),
-  task_id: optionalNullableString(),
-  flow_id: optionalNullableString(),
-  step_id: optionalNullableString(),
-  idempotency_key: optionalNullableString(),
-  content_hash: optionalNullableString(),
-  channel: Type.Optional(channelSchema),
-  runtime: Type.Optional(runtimeSchema),
-  models_used: Type.Optional(Type.Array(Type.Object({
-    provider: Type.String(),
-    model: Type.String(),
-    role: Type.String()
-  }))),
-  source_refs: Type.Optional(Type.Array(Type.Object({
-    kind: Type.String(),
-    uri: optionalNullableString(),
-    title: optionalNullableString(),
-    timestamp: optionalNullableString()
-  }))),
-  memory_payload: memoryPayloadSchema,
-  provenance: Type.Optional(Type.Object({
-    default_status: Type.Optional(Type.Union([
-      Type.Literal("observed"),
-      Type.Literal("inferred"),
-      Type.Literal("user_confirmed"),
-      Type.Literal("imported"),
-      Type.Literal("generated")
-    ])),
-    confidence: Type.Optional(Type.Number({ minimum: 0, maximum: 1 })),
-    requires_review: Type.Optional(Type.Boolean())
-  })),
-  retention: Type.Optional(Type.Object({
-    ttl_days: optionalNullableInteger(),
-    stale_after_days: optionalNullableInteger()
-  })),
-  visibility: Type.Optional(Type.Object({
-    workspace: optionalNullableString(),
-    project: optionalNullableString(),
-    channel: optionalNullableString()
-  }))
-});
 
 // src/index.ts
 async function clientFromApi(api) {
@@ -393,12 +279,12 @@ var index_default = definePluginEntry({
       name: "openbrain_report_usage",
       label: "NBJ OB1 report usage",
       description: "Report which recalled memories were used or ignored.",
-      parameters: Type2.Object({
-        request_id: Type2.String(),
-        used_memory_ids: Type2.Optional(Type2.Array(Type2.String())),
-        ignored: Type2.Optional(Type2.Array(Type2.Object({
-          memory_id: Type2.String(),
-          reason: Type2.Optional(Type2.String())
+      parameters: Type.Object({
+        request_id: Type.String(),
+        used_memory_ids: Type.Optional(Type.Array(Type.String())),
+        ignored: Type.Optional(Type.Array(Type.Object({
+          memory_id: Type.String(),
+          reason: Type.Optional(Type.String())
         })))
       }),
       run: (client, input) => client.reportUsage(input.request_id, {
@@ -410,16 +296,16 @@ var index_default = definePluginEntry({
       name: "openbrain_inspect_memory",
       label: "NBJ OB1 inspect memory",
       description: "Inspect one Nate Jones OB1 Agent Memory record, including provenance and source references.",
-      parameters: Type2.Object({ memory_id: Type2.String() }),
+      parameters: Type.Object({ memory_id: Type.String() }),
       run: (client, input) => client.inspectMemory(input.memory_id)
     });
     registerTool(api, {
       name: "openbrain_list_review_queue",
       label: "NBJ OB1 review queue",
       description: "List agent-written memories pending human review.",
-      parameters: Type2.Object({
-        workspace_id: Type2.Optional(Type2.String()),
-        project_id: Type2.Optional(Type2.String())
+      parameters: Type.Object({
+        workspace_id: Type.Optional(Type.String()),
+        project_id: Type.Optional(Type.String())
       }),
       run: (client, input) => client.listReviewQueue(input)
     });
@@ -427,26 +313,26 @@ var index_default = definePluginEntry({
       name: "openbrain_review_memory",
       label: "NBJ OB1 review memory",
       description: "Confirm, edit, evidence-only, restrict, stale, dispute, supersede, or reject a memory.",
-      parameters: Type2.Object({
-        memory_id: Type2.String(),
-        action: Type2.Union([
-          Type2.Literal("confirm"),
-          Type2.Literal("edit"),
-          Type2.Literal("evidence_only"),
-          Type2.Literal("restrict_scope"),
-          Type2.Literal("mark_stale"),
-          Type2.Literal("merge"),
-          Type2.Literal("reject"),
-          Type2.Literal("dispute"),
-          Type2.Literal("supersede")
+      parameters: Type.Object({
+        memory_id: Type.String(),
+        action: Type.Union([
+          Type.Literal("confirm"),
+          Type.Literal("edit"),
+          Type.Literal("evidence_only"),
+          Type.Literal("restrict_scope"),
+          Type.Literal("mark_stale"),
+          Type.Literal("merge"),
+          Type.Literal("reject"),
+          Type.Literal("dispute"),
+          Type.Literal("supersede")
         ]),
-        actor_id: Type2.Optional(Type2.String()),
-        actor_label: Type2.Optional(Type2.String()),
-        notes: Type2.Optional(Type2.String()),
-        content: Type2.Optional(Type2.String()),
-        summary: Type2.Optional(Type2.String()),
-        visibility: Type2.Optional(Type2.String()),
-        related_memory_id: Type2.Optional(Type2.String())
+        actor_id: Type.Optional(Type.String()),
+        actor_label: Type.Optional(Type.String()),
+        notes: Type.Optional(Type.String()),
+        content: Type.Optional(Type.String()),
+        summary: Type.Optional(Type.String()),
+        visibility: Type.Optional(Type.String()),
+        related_memory_id: Type.Optional(Type.String())
       }),
       run: (client, input) => {
         const { memory_id, ...body } = input;
@@ -457,9 +343,118 @@ var index_default = definePluginEntry({
       name: "openbrain_get_recall_trace",
       label: "NBJ OB1 recall trace",
       description: "Fetch a recall trace to debug which memories were returned and used.",
-      parameters: Type2.Object({ request_id: Type2.String() }),
+      parameters: Type.Object({ request_id: Type.String() }),
       run: (client, input) => client.getRecallTrace(input.request_id)
     });
+    const OB1_TOOL_NAMES = [
+      "openbrain_recall",
+      "openbrain_writeback",
+      "openbrain_report_usage",
+      "openbrain_inspect_memory",
+      "openbrain_list_review_queue",
+      "openbrain_review_memory",
+      "openbrain_get_recall_trace"
+    ];
+    function isConfigured() {
+      const raw = api.pluginConfig || {};
+      return typeof raw.endpoint === "string" && raw.endpoint.length > 0 && typeof raw.workspaceId === "string" && raw.workspaceId.length > 0;
+    }
+    if (typeof api.registerMemoryPromptSupplement === "function") {
+      api.registerMemoryPromptSupplement((params) => {
+        if (!isConfigured()) return [];
+        const present = OB1_TOOL_NAMES.filter((t) => params.availableTools.has(t));
+        if (present.length === 0) return [];
+        return [
+          "## OB1 Agent Memory",
+          "Long-term governed memory is available via OB1. Use it as a discipline, not a fallback.",
+          "",
+          "Workflow:",
+          "- Before meaningful work, call `openbrain_recall` with a task-scoped query.",
+          "- Treat returned memories tagged `instruction` as binding rules; `evidence`-tagged ones as supporting context only.",
+          "- After meaningful work, call `openbrain_writeback` with compact, provenance-labeled findings (decisions, lessons, constraints, outputs, failures).",
+          "- After acting on recalled memories, call `openbrain_report_usage` with `request_id` and the IDs you used vs. ignored \u2014 closes the recall-quality loop.",
+          "",
+          `Available tools: ${present.map((t) => "`" + t + "`").join(", ")}.`
+        ];
+      });
+    }
+    if (typeof api.registerMemoryCorpusSupplement === "function") {
+      api.registerMemoryCorpusSupplement({
+        async search(input) {
+          if (!isConfigured()) return [];
+          let client;
+          try {
+            client = await clientFromApi(api);
+          } catch {
+            return [];
+          }
+          const limit = Math.min(Math.max(input.maxResults ?? 10, 1), 50);
+          let response;
+          try {
+            response = await client.recall({
+              query: input.query.slice(0, 2e3),
+              task_type: "general",
+              limits: { max_items: limit, max_tokens: 4e3 },
+              scope: { project_only: false, include_unconfirmed: false, include_stale: false }
+            });
+          } catch {
+            return [];
+          }
+          const memories = Array.isArray(response?.memories) ? response.memories : [];
+          return memories.map((m, i) => {
+            const policy = m?.use_policy ?? {};
+            const provenance = policy?.can_use_as_instruction ? "instruction" : policy?.can_use_as_evidence ? "evidence" : void 0;
+            return {
+              corpus: "openbrain",
+              path: `openbrain://memory/${m?.id ?? i}`,
+              title: typeof m?.summary === "string" ? m.summary.slice(0, 80) : void 0,
+              kind: "memory",
+              score: typeof m?.score === "number" ? m.score : Math.max(0, 1 - i / Math.max(memories.length, 1)),
+              snippet: String(m?.summary ?? m?.content ?? "").slice(0, 600),
+              id: typeof m?.id === "string" ? m.id : void 0,
+              provenanceLabel: provenance,
+              source: "openbrain.agent_memory",
+              sourceType: "openbrain.agent_memory",
+              updatedAt: typeof m?.updated_at === "string" ? m.updated_at : void 0
+            };
+          });
+        },
+        async get(input) {
+          if (!isConfigured()) return null;
+          const id = input.lookup.replace(/^openbrain:\/\/memory\//, "");
+          if (!id) return null;
+          let client;
+          try {
+            client = await clientFromApi(api);
+          } catch {
+            return null;
+          }
+          let memory;
+          try {
+            memory = await client.inspectMemory(id);
+          } catch {
+            return null;
+          }
+          if (!memory || typeof memory !== "object") return null;
+          const policy = memory?.use_policy ?? {};
+          const provenance = policy?.can_use_as_instruction ? "instruction" : policy?.can_use_as_evidence ? "evidence" : void 0;
+          const content = String(memory?.content ?? memory?.summary ?? "");
+          return {
+            corpus: "openbrain",
+            path: input.lookup,
+            title: typeof memory?.summary === "string" ? memory.summary.slice(0, 80) : void 0,
+            kind: "memory",
+            content,
+            fromLine: 1,
+            lineCount: content.split("\n").length,
+            id: typeof memory?.id === "string" ? memory.id : id,
+            provenanceLabel: provenance,
+            sourceType: "openbrain.agent_memory",
+            updatedAt: typeof memory?.updated_at === "string" ? memory.updated_at : void 0
+          };
+        }
+      });
+    }
   }
 });
 export {

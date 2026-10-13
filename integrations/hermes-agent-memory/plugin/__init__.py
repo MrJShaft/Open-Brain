@@ -14,7 +14,7 @@ Provides:
 
 Config:
 - $HERMES_HOME/ob1.json — non-secret (endpoint, workspace_id, project_id, options)
-- env var OPENBRAIN_KEY — the OB1 access key (x-brain-key header)
+- env var OPENBRAIN_KEY — this Agent's unique OB1 bearer token
 - env var OPENBRAIN_URL — optional override for endpoint
 
 Install:
@@ -429,7 +429,7 @@ def _format_recall_context(memories: List[Dict[str, Any]], max_results: int) -> 
 class _OB1Client:
     """Thin sync HTTP client for the OB1 Agent Memory API.
 
-    Uses x-brain-key header (NOT Authorization Bearer) per the OB1 contract.
+    Uses this Agent's unique Authorization Bearer token.
     All methods raise on transport errors; callers wrap appropriately.
     """
 
@@ -447,7 +447,7 @@ class _OB1Client:
             method=method,
             headers={
                 "Content-Type": "application/json",
-                "x-brain-key": self._access_key,
+                "Authorization": f"Bearer {self._access_key}",
             },
         )
         try:
@@ -746,7 +746,7 @@ class OB1MemoryProvider(MemoryProvider):
             },
             {
                 "key": "access_key",
-                "description": "OB1 access key (sent as x-brain-key header)",
+                "description": "Unique OB1 bearer token assigned to this Agent",
                 "secret": True,
                 "required": True,
                 "env_var": "OPENBRAIN_KEY",

@@ -39,7 +39,7 @@ export class AgentMemoryClient {
       method: options.method || "GET",
       headers: {
         "content-type": "application/json",
-        "x-brain-key": this.accessKey,
+        authorization: `Bearer ${this.accessKey}`,
       },
       body: options.body === undefined ? undefined : JSON.stringify(options.body),
     });
