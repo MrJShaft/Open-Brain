@@ -3,6 +3,7 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
+const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY");
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -42,7 +43,15 @@ Only extract what's explicitly there.` },
   catch { return { topics: ["uncategorized"], type: "observation" }; }
 }
 
-Deno.serve(async (_req: Request): Promise<Response> => {
+Deno.serve(async (req: Request): Promise<Response> => {
+  // Auth: same access key as open-brain-mcp (x-brain-key header or ?key=)
+  const provided = req.headers.get("x-brain-key") || new URL(req.url).searchParams.get("key");
+  if (!MCP_ACCESS_KEY || !provided || provided !== MCP_ACCESS_KEY) {
+    return new Response(JSON.stringify({ error: "Unauthorized" }), {
+      status: 401,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
   try {
     // Fetch all thoughts with null embeddings
     const { data: thoughts, error: fetchError } = await supabase

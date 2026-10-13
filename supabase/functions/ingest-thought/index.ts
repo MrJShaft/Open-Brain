@@ -6,6 +6,9 @@ const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const SLACK_BOT_TOKEN = Deno.env.get("SLACK_BOT_TOKEN")!;
 const SLACK_CAPTURE_CHANNEL = Deno.env.get("SLACK_CAPTURE_CHANNEL")!;
 
+const SLACK_SIGNING_SECRET = Deno.env.get("SLACK_SIGNING_SECRET");
+const SLACK_MAX_AGE_SECONDS = 60 * 5;
+
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -51,9 +54,43 @@ async function replyInSlack(channel: string, threadTs: string, text: string): Pr
   });
 }
 
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// Verify Slack request signature: v0=HMAC_SHA256(secret, "v0:" + timestamp + ":" + rawBody)
+async function verifySlackSignature(req: Request, rawBody: string): Promise<boolean> {
+  if (!SLACK_SIGNING_SECRET) {
+    console.warn("SLACK_SIGNING_SECRET is not set; skipping Slack signature verification");
+    return true;
+  }
+  const timestamp = req.headers.get("x-slack-request-timestamp");
+  const signature = req.headers.get("x-slack-signature");
+  if (!timestamp || !signature) return false;
+  const ts = Number(timestamp);
+  if (!Number.isFinite(ts) || Math.abs(Date.now() / 1000 - ts) > SLACK_MAX_AGE_SECONDS) return false;
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(SLACK_SIGNING_SECRET),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const mac = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`v0:${timestamp}:${rawBody}`));
+  const expected = "v0=" + Array.from(new Uint8Array(mac)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return timingSafeEqual(expected, signature);
+}
+
 Deno.serve(async (req: Request): Promise<Response> => {
   try {
-    const body = await req.json();
+    const rawBody = await req.text();
+    if (!(await verifySlackSignature(req, rawBody))) {
+      return new Response("invalid signature", { status: 401 });
+    }
+    const body = JSON.parse(rawBody);
     if (body.type === "url_verification") {
       return new Response(JSON.stringify({ challenge: body.challenge }), {
         headers: { "Content-Type": "application/json" },
