@@ -6,6 +6,8 @@ const accessKey = requiredEnv("OB1_AGENT_MEMORY_KEY");
 const workspaceId = process.env.OB1_AGENT_MEMORY_WORKSPACE_ID || "ob1-staging";
 const deniedWorkspaceId = process.env.OB1_AGENT_MEMORY_DENIED_WORKSPACE_ID || `${workspaceId}-not-authorized`;
 const projectId = process.env.OB1_AGENT_MEMORY_PROJECT_ID || "agent-memory-api-smoke";
+const foreignMemoryId = process.env.OB1_AGENT_MEMORY_FOREIGN_MEMORY_ID;
+const foreignRequestId = process.env.OB1_AGENT_MEMORY_FOREIGN_REQUEST_ID;
 const runId = process.env.OB1_AGENT_MEMORY_RUN_ID || new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14);
 const taskId = `agent-memory-api-smoke-${runId}`;
 
@@ -147,6 +149,22 @@ async function main() {
   assert(inspected.memory?.id === writtenIds[0], "inspect returned the wrong memory");
   summary.checks.inspect_memory = "passed";
 
+  if (foreignMemoryId) {
+    await expectStatusOnly(`/memories/${encodeURIComponent(foreignMemoryId)}`, 404);
+  }
+
+  if (foreignRequestId) {
+    await expectStatusOnly(`/recall-traces/${encodeURIComponent(foreignRequestId)}`, 404);
+    await expectStatusOnly(`/recall/${encodeURIComponent(foreignRequestId)}/usage`, 404, {
+      method: "POST",
+      body: { used_memory_ids: [], ignored: [] },
+    });
+  }
+
+  summary.checks.foreign_id_isolation = foreignMemoryId || foreignRequestId
+    ? { status: "passed", memory_id_probe: Boolean(foreignMemoryId), request_id_probe: Boolean(foreignRequestId) }
+    : "not run; set foreign fixture IDs to exercise other-Agent/other-workspace route probes";
+
   const trace = await request(`/recall-traces/${inclusiveRecall.request_id}`);
   assert(trace.items?.some((item) => item.memory_id === recalledWrittenId && item.used === true), "recall trace did not mark used memory");
   summary.checks.recall_trace = {
@@ -271,6 +289,20 @@ async function request(path, options = {}) {
     fail(`Expected ${expectedStatus} from ${path}, got ${response.status}: ${JSON.stringify(data).slice(0, 500)}`);
   }
   return data;
+}
+
+async function expectStatusOnly(path, expectedStatus, options = {}) {
+  const response = await fetch(`${endpoint}${path}`, {
+    method: options.method || "GET",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${accessKey}`,
+    },
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  if (response.status !== expectedStatus) {
+    fail(`Expected ${expectedStatus} from isolation probe ${path}, got ${response.status}`);
+  }
 }
 
 function requiredEnv(name) {

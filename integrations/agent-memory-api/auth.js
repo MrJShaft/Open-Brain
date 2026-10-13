@@ -1,83 +1,50 @@
 const SHA256_HEX = /^[a-f0-9]{64}$/i;
 const BEARER_TOKEN = /^Bearer\s+([A-Za-z0-9_-]{43,})$/i;
 
-/** Parse immutable Agent IDs to { token_sha256, workspace_ids } credentials. */
-export function parseAgentCredentials(raw) {
-  if (!raw || !raw.trim()) return new Map();
-
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    throw new Error("AGENT_API_CREDENTIALS_JSON must be valid JSON.");
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("AGENT_API_CREDENTIALS_JSON must be an object of Agent credentials.");
-  }
-
-  const result = new Map();
-  const seenDigests = new Set();
-  for (const [agentId, credential] of Object.entries(parsed)) {
-    if (!agentId || agentId.trim() !== agentId || agentId.length > 256) {
-      throw new Error("AGENT_API_CREDENTIALS_JSON contains an invalid Agent ID.");
-    }
-    if (!credential || typeof credential !== "object" || Array.isArray(credential)) {
-      throw new Error("Each Agent credential must be an object.");
-    }
-    const keys = Object.keys(credential).sort();
-    if (keys.length !== 2 || keys[0] !== "token_sha256" || keys[1] !== "workspace_ids") {
-      throw new Error("Each Agent credential must contain only token_sha256 and workspace_ids.");
-    }
-    if (typeof credential.token_sha256 !== "string" || !SHA256_HEX.test(credential.token_sha256)) {
-      throw new Error("token_sha256 must be a 64-character SHA-256 hex digest.");
-    }
-    if (!Array.isArray(credential.workspace_ids) || credential.workspace_ids.length < 1 || credential.workspace_ids.length > 100) {
-      throw new Error("workspace_ids must contain between 1 and 100 authorized workspace IDs.");
-    }
-
-    const workspaceIds = [];
-    const seenWorkspaces = new Set();
-    for (const workspaceId of credential.workspace_ids) {
-      if (typeof workspaceId !== "string" || workspaceId.trim() !== workspaceId || workspaceId.length < 1 || workspaceId.length > 200 || /[\u0000-\u001f\u007f]/.test(workspaceId)) {
-        throw new Error("workspace_ids contains an invalid workspace ID.");
-      }
-      if (seenWorkspaces.has(workspaceId)) {
-        throw new Error("workspace_ids cannot contain duplicates.");
-      }
-      seenWorkspaces.add(workspaceId);
-      workspaceIds.push(workspaceId);
-    }
-
-    const normalizedDigest = credential.token_sha256.toLowerCase();
-    if (seenDigests.has(normalizedDigest)) {
-      throw new Error("AGENT_API_CREDENTIALS_JSON cannot assign one token to multiple Agents.");
-    }
-    seenDigests.add(normalizedDigest);
-    result.set(agentId, { digest: normalizedDigest, workspaceIds });
-  }
-  return result;
-}
-
 export async function sha256Hex(value) {
   const bytes = new TextEncoder().encode(value);
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-/** Return the configured Agent identity and workspace allowlist for a valid bearer token. */
-export async function authenticateAgent(authorization, credentials) {
+/** Look up the bearer-token digest in the protected credential store and return its Agent scope. */
+export async function authenticateAgent(authorization, lookupCredentialByDigest) {
   if (typeof authorization !== "string") return null;
   const match = BEARER_TOKEN.exec(authorization.trim());
   if (!match) return null;
+  if (typeof lookupCredentialByDigest !== "function") {
+    throw new TypeError("A credential lookup function is required.");
+  }
 
   const candidateDigest = await sha256Hex(match[1]);
-  let authenticatedAgent = null;
-  for (const [agentId, credential] of credentials) {
-    if (constantTimeEqual(candidateDigest, credential.digest)) {
-      authenticatedAgent = { agentId, workspaceIds: [...credential.workspaceIds] };
-    }
+  const credential = await lookupCredentialByDigest(candidateDigest);
+  if (!credential) return null;
+  if (credential.enabled !== true) return null;
+  if (typeof credential.agent_id !== "string" || credential.agent_id.trim() !== credential.agent_id || credential.agent_id.length < 1 || credential.agent_id.length > 256 || /[\u0000-\u001f\u007f]/.test(credential.agent_id)) {
+    throw new Error("Credential registry contains an invalid Agent ID.");
   }
-  return authenticatedAgent;
+  if (typeof credential.token_sha256 !== "string" || !SHA256_HEX.test(credential.token_sha256)) {
+    throw new Error("Credential registry contains an invalid token digest.");
+  }
+  if (!constantTimeEqual(candidateDigest, credential.token_sha256.toLowerCase())) return null;
+  if (!Array.isArray(credential.workspace_ids) || credential.workspace_ids.length < 1 || credential.workspace_ids.length > 100) {
+    throw new Error("Credential registry contains an invalid workspace allowlist.");
+  }
+
+  const workspaceIds = [];
+  const seenWorkspaces = new Set();
+  for (const workspaceId of credential.workspace_ids) {
+    if (typeof workspaceId !== "string" || workspaceId.trim() !== workspaceId || workspaceId.length < 1 || workspaceId.length > 200 || /[\u0000-\u001f\u007f]/.test(workspaceId)) {
+      throw new Error("Credential registry contains an invalid workspace ID.");
+    }
+    if (seenWorkspaces.has(workspaceId)) {
+      throw new Error("Credential registry contains a duplicate workspace ID.");
+    }
+    seenWorkspaces.add(workspaceId);
+    workspaceIds.push(workspaceId);
+  }
+
+  return { agentId: credential.agent_id, workspaceIds };
 }
 
 export function isWorkspaceAllowed(workspaceIds, workspaceId) {

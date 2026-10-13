@@ -8,13 +8,11 @@ import {
   isWorkspaceAllowed,
   ownsPersonalMemory,
   ownsRecallTrace,
-  parseAgentCredentials,
 } from "./auth.js";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
-const AGENT_API_CREDENTIALS = parseAgentCredentials(Deno.env.get("AGENT_API_CREDENTIALS_JSON") ?? "");
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
@@ -372,7 +370,21 @@ const app = new Hono<AppEnv>();
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
 
 app.use("*", async (c, next) => {
-  const agent = await authenticateAgent(c.req.header("authorization"), AGENT_API_CREDENTIALS);
+  let agent;
+  try {
+    agent = await authenticateAgent(c.req.header("authorization"), async (tokenDigest: string) => {
+      const { data, error } = await supabase
+        .from("agent_api_credentials")
+        .select("agent_id, token_sha256, workspace_ids, enabled")
+        .eq("token_sha256", tokenDigest)
+        .eq("enabled", true)
+        .maybeSingle();
+      if (error) throw new Error("Agent credential registry lookup failed");
+      return data;
+    });
+  } catch {
+    return c.json({ error: "Agent credential registry is unavailable" }, 503, corsHeaders);
+  }
   if (!agent) return c.json({ error: "Invalid or missing Agent bearer token" }, 401, corsHeaders);
   c.set("agentId", agent.agentId);
   c.set("workspaceIds", agent.workspaceIds);

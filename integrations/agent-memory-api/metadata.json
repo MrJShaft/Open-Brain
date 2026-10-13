@@ -1,6 +1,6 @@
 {
   "name": "Agent Memory API",
-  "description": "Runtime-neutral Supabase Edge Function for Agent- and workspace-scoped OB1 Memory recall, write-back, shared memory, review, inspection, and traces.",
+  "description": "Runtime-neutral Supabase Edge Function for Agent- and workspace-scoped OB1 Memory recall, write-back, shared memory, review, inspection, and traces; bearer hashes are verified against a service-role-only registry.",
   "category": "integrations",
   "author": {
     "name": "Nate Jones Team",

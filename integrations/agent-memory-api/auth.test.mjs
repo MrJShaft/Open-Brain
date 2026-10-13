@@ -6,56 +6,88 @@ import {
   isWorkspaceAllowed,
   ownsPersonalMemory,
   ownsRecallTrace,
-  parseAgentCredentials,
   sha256Hex,
 } from "./auth.js";
 
 const tokenA = "a".repeat(43);
 const tokenB = "b".repeat(43);
 
-async function credentialMap() {
-  return parseAgentCredentials(JSON.stringify({
-    agent_a: { token_sha256: await sha256Hex(tokenA), workspace_ids: ["workspace_a"] },
-    agent_b: { token_sha256: await sha256Hex(tokenB), workspace_ids: ["workspace_a", "workspace_b"] },
-  }));
+async function credentialStore() {
+  const rowsByDigest = new Map();
+  const entries = [
+    { token: tokenA, agent_id: "agent_a", workspace_ids: ["workspace_a"] },
+    { token: tokenB, agent_id: "agent_b", workspace_ids: ["workspace_a", "workspace_b"] },
+  ];
+  for (const entry of entries) {
+    const digest = await sha256Hex(entry.token);
+    rowsByDigest.set(digest, {
+      agent_id: entry.agent_id,
+      token_sha256: digest,
+      workspace_ids: entry.workspace_ids,
+      enabled: true,
+    });
+  }
+  return async (digest) => rowsByDigest.get(digest) ?? null;
 }
 
-test("a bearer token resolves only to its configured Agent and workspace allowlist", async () => {
-  const credentials = await credentialMap();
-  const agentA = await authenticateAgent(`Bearer ${tokenA}`, credentials);
+test("a bearer token resolves through its digest to one immutable Agent and workspace allowlist", async () => {
+  const lookup = await credentialStore();
+  const agentA = await authenticateAgent(`Bearer ${tokenA}`, lookup);
 
   assert.deepEqual(agentA, { agentId: "agent_a", workspaceIds: ["workspace_a"] });
-  assert.equal(await authenticateAgent(`Bearer ${"c".repeat(43)}`, credentials), null);
+  assert.equal(await authenticateAgent(`Bearer ${"c".repeat(43)}`, lookup), null);
 });
 
-test("missing, malformed, and legacy shared-key headers do not authenticate", async () => {
-  const credentials = await credentialMap();
+test("missing, malformed, and legacy shared-key headers do not query or authenticate", async () => {
+  let lookups = 0;
+  const lookup = async () => { lookups += 1; return null; };
 
-  assert.equal(await authenticateAgent(undefined, credentials), null);
-  assert.equal(await authenticateAgent(tokenA, credentials), null);
-  assert.equal(await authenticateAgent(`Bearer short`, credentials), null);
-  assert.equal(await authenticateAgent(`x-brain-key: ${tokenA}`, credentials), null);
+  assert.equal(await authenticateAgent(undefined, lookup), null);
+  assert.equal(await authenticateAgent(tokenA, lookup), null);
+  assert.equal(await authenticateAgent("Bearer short", lookup), null);
+  assert.equal(await authenticateAgent(`x-brain-key: ${tokenA}`, lookup), null);
+  assert.equal(lookups, 0);
 });
 
-test("empty, malformed, ambiguous, or unscoped credentials fail closed", async () => {
-  assert.equal(await authenticateAgent(`Bearer ${tokenA}`, parseAgentCredentials("")), null);
-  assert.throws(() => parseAgentCredentials("not-json"), /valid JSON/);
-  assert.throws(() => parseAgentCredentials(JSON.stringify({ agent_a: { token_sha256: "short", workspace_ids: ["workspace_a"] } })), /64-character/);
-  assert.throws(() => parseAgentCredentials(JSON.stringify({ agent_a: { token_sha256: "a".repeat(64), workspace_ids: [] } })), /workspace_ids/);
-  assert.throws(() => parseAgentCredentials(JSON.stringify({ agent_a: { token_sha256: "a".repeat(64), workspace_ids: ["workspace_a", "workspace_a"] } })), /duplicates/);
-  assert.throws(() => parseAgentCredentials(JSON.stringify({ agent_a: { token_sha256: "a".repeat(64), workspace_ids: ["workspace_a"], extra: true } })), /only token_sha256 and workspace_ids/);
+test("malformed credential rows fail closed and a mismatched digest is rejected", async () => {
+  await assert.rejects(
+    authenticateAgent(`Bearer ${tokenA}`, async () => ({
+      agent_id: " agent_a",
+      token_sha256: await sha256Hex(tokenA),
+      workspace_ids: ["workspace_a"],
+      enabled: true,
+    })),
+    /invalid Agent ID/,
+  );
+  assert.equal(await authenticateAgent(`Bearer ${tokenA}`, async () => ({
+    agent_id: "agent_a",
+    token_sha256: "0".repeat(64),
+    workspace_ids: ["workspace_a"],
+    enabled: true,
+  })), null);
+  await assert.rejects(
+    authenticateAgent(`Bearer ${tokenA}`, async () => ({
+      agent_id: "agent_a",
+      token_sha256: await sha256Hex(tokenA),
+      workspace_ids: [],
+      enabled: true,
+    })),
+    /workspace allowlist/,
+  );
 });
 
-test("one token digest cannot be assigned to more than one Agent", async () => {
+test("disabled credentials are not accepted", async () => {
   const digest = await sha256Hex(tokenA);
-  assert.throws(() => parseAgentCredentials(JSON.stringify({
-    first: { token_sha256: digest, workspace_ids: ["workspace_a"] },
-    second: { token_sha256: digest, workspace_ids: ["workspace_a"] },
-  })), /multiple Agents/);
+  assert.equal(await authenticateAgent(`Bearer ${tokenA}`, async () => ({
+    agent_id: "agent_a",
+    token_sha256: digest,
+    workspace_ids: ["workspace_a"],
+    enabled: false,
+  })), null);
 });
 
 test("a personal-memory access attempt is denied across Agent and workspace boundaries", async () => {
-  const agentA = await authenticateAgent(`Bearer ${tokenA}`, await credentialMap());
+  const agentA = await authenticateAgent(`Bearer ${tokenA}`, await credentialStore());
   const memoryOwnedByA = { authenticated_agent_id: "agent_a" };
   const memoryOwnedByB = { authenticated_agent_id: "agent_b" };
 
@@ -68,7 +100,7 @@ test("a personal-memory access attempt is denied across Agent and workspace boun
 });
 
 test("a trace/request-ID access attempt is denied across Agent and workspace boundaries", async () => {
-  const agentA = await authenticateAgent(`Bearer ${tokenA}`, await credentialMap());
+  const agentA = await authenticateAgent(`Bearer ${tokenA}`, await credentialStore());
 
   assert.equal(ownsRecallTrace(agentA, {
     workspace_id: "workspace_a",

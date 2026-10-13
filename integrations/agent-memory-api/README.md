@@ -26,24 +26,31 @@ This Edge Function exposes the v1 OB1 Agent Memory contract. OpenClaw is the fir
 ## Prerequisites
 
 - Working Open Brain setup ([guide](../../docs/01-getting-started.md))
-- [`schemas/agent-memory`](../../schemas/agent-memory/) applied
+- [`schemas/agent-memory`](../../schemas/agent-memory/) applied, including `api-credentials.sql`
 - Supabase CLI installed for manual deployment
-- `OPENROUTER_API_KEY` and `AGENT_API_CREDENTIALS_JSON` configured as Supabase function secrets
-- A unique cryptographically random bearer token per Agent; only each token's SHA-256 digest is stored in the function secret
+- `OPENROUTER_API_KEY` configured as a Supabase function secret for embedding-based recall/write-back
+- A unique cryptographically random bearer token per Agent; store the raw token only in that Agent's connector and store only its SHA-256 digest in `agent_api_credentials`
 
 ## Authentication and Trust Boundaries
 
-Every endpoint, including `/health`, requires `Authorization: Bearer <agent-token>`. The API hashes the presented token and maps it to exactly one immutable Agent ID plus an explicit workspace allowlist in `AGENT_API_CREDENTIALS_JSON`; request bodies and other headers cannot choose either value. Every caller-supplied workspace must be in that Agent's allowlist. Personal `agent_memories` are additionally filtered by the server-stamped `metadata.authenticated_agent_id`, while trace access is filtered by the authenticated Agent recorded in `request_payload`. Tokens are never accepted in query parameters or via the legacy `x-brain-key` header. Use a unique token for each Agent and never reuse the shared `MCP_ACCESS_KEY`.
+Every endpoint, including `/health`, requires `Authorization: Bearer <agent-token>`. The API hashes the presented token and looks up the digest in `public.agent_api_credentials` using its existing Supabase service-role client. The registry maps each digest to exactly one immutable Agent ID plus an explicit workspace allowlist; the registry grants only `SELECT` to `service_role` and no access to `anon` or `authenticated`. No additional custom Edge Function secret is required for Agent credentials. Request bodies and other headers cannot choose either identity or workspace authorization. Personal `agent_memories` are additionally filtered by the server-stamped `metadata.authenticated_agent_id`, while trace access is filtered by the authenticated Agent recorded in `request_payload`. Tokens are never accepted in query parameters or via the legacy `x-brain-key` header. Use a unique token for each Agent and never reuse the shared `MCP_ACCESS_KEY`.
 
-Generate a fresh 32-byte token and its SHA-256 digest in a trusted environment. Store the raw token only in that Agent's secret-backed connector/runtime setting, and store only the digest plus that Agent's explicit allowed workspaces in Supabase. Do not commit either value. The function secret has this shape (replace every placeholder with the intended immutable Agent ID, digest, and workspace IDs):
+Generate a fresh 32-byte URL-safe token and its SHA-256 digest in a trusted environment. Store the raw token only in that Agent's secret-backed connector/runtime setting, and store only the digest plus that Agent's explicit allowed workspaces in `public.agent_api_credentials`. Do not commit either value. Example generation prints only the digest while keeping the raw token in the shell variable for the connector setup:
 
-```json
-{
-  "<immutable-agent-id>": {
-    "token_sha256": "<64-character-sha256-hex-digest>",
-    "workspace_ids": ["<authorized-workspace-id>"]
-  }
-}
+```bash
+TOKEN="$(node -e "process.stdout.write(require('node:crypto').randomBytes(32).toString('base64url'))")"
+printf '%s' "$TOKEN" | openssl dgst -sha256 | awk '{print $NF}'
+```
+
+Provision the digest and allowlist as a database-owner action (never store the raw token in the database):
+
+```sql
+INSERT INTO public.agent_api_credentials (agent_id, token_sha256, workspace_ids)
+VALUES ('<immutable-agent-id>', '<64-character-sha256-hex-digest>', ARRAY['<authorized-workspace-id>'])
+ON CONFLICT (agent_id) DO UPDATE
+SET token_sha256 = EXCLUDED.token_sha256,
+    workspace_ids = EXCLUDED.workspace_ids,
+    enabled = true;
 ```
 
 Personal records or traces without a matching authenticated-Agent attribution are intentionally invisible through these routes; legacy rows are not automatically assigned to an Agent. Backfill ownership only after verifying it from a trusted source.
@@ -59,6 +66,7 @@ AGENT MEMORY API -- CREDENTIAL TRACKER
 FROM YOUR OPEN BRAIN SETUP
   Supabase Project ref:       ____________
   Immutable Agent ID:         ____________
+  Authorized workspace ID(s): ____________
   Per-Agent bearer token:     ____________
 
 GENERATED DURING SETUP
@@ -70,7 +78,7 @@ GENERATED DURING SETUP
 
 ## Deployment
 
-Apply [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql) and [`schemas/agent-memory/shared-memories.sql`](../../schemas/agent-memory/shared-memories.sql), then configure `AGENT_API_CREDENTIALS_JSON` with the per-Agent token digest and workspace allowlist map above. Supabase Edge Functions provide `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` automatically; configure `OPENROUTER_API_KEY` for embedding-based recall/write-back.
+Apply [`schemas/agent-memory/schema.sql`](../../schemas/agent-memory/schema.sql), [`schemas/agent-memory/shared-memories.sql`](../../schemas/agent-memory/shared-memories.sql), and [`schemas/agent-memory/api-credentials.sql`](../../schemas/agent-memory/api-credentials.sql). Securely provision the Agent's credential row before deployment. Supabase Edge Functions provide `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` automatically; configure only the existing `OPENROUTER_API_KEY` for embedding-based recall/write-back.
 
 Copy this folder into your Supabase project and deploy with custom authentication enabled in the function body:
 
@@ -82,7 +90,7 @@ cp integrations/agent-memory-api/deno.json supabase/functions/agent-memory-api/d
 supabase functions deploy agent-memory-api --no-verify-jwt
 ```
 
-`--no-verify-jwt` is intentional because the function enforces per-Agent bearer-token authentication itself. Do not deploy until the Agent credential map, including explicit workspace allowlists, is configured.
+`--no-verify-jwt` is intentional because the function enforces per-Agent bearer-token authentication itself. Do not deploy until an enabled per-Agent hash/workspace row exists in `agent_api_credentials` and that Agent's raw token is securely stored in its connector/runtime setting.
 
 Verify the deployment without putting the token in the URL:
 
@@ -127,7 +135,7 @@ The trust model is documented in [Safe Agent Memory and Provenance](../../docs/s
 
 ## Smoke Harness
 
-Use the live smoke harness after deploying the Edge Function and configuring the per-Agent token digest/workspace map. Its denied-workspace test uses `OB1_AGENT_MEMORY_DENIED_WORKSPACE_ID` or a derived workspace ID that must not be in the Agent's allowlist:
+Use the live smoke harness after deploying the Edge Function and configuring the per-Agent credential registry row. Its denied-workspace test uses `OB1_AGENT_MEMORY_DENIED_WORKSPACE_ID` or a derived workspace ID that must not be in the Agent's allowlist:
 
 ```bash
 OB1_AGENT_MEMORY_ENDPOINT="https://YOUR_PROJECT_REF.supabase.co/functions/v1/agent-memory-api" \
@@ -138,7 +146,7 @@ OB1_AGENT_MEMORY_DENIED_WORKSPACE_ID="ob1-not-authorized" \
 node integrations/agent-memory-api/smoke/live-smoke.mjs
 ```
 
-The harness checks anonymous and legacy-key rejection, authenticated health, cross-workspace denial for personal/shared reads and recall/write-back, shared-memory scope validation, enforcement of pending status against a forged import claim, conservative recall gating, include-unconfirmed recall, usage reporting, Agent-review denial, memory inspection, recall trace, and unsafe write-back blocking. The unit suite separately exercises cross-Agent and cross-workspace record/trace ownership. It prints a JSON summary and never prints the token.
+The harness checks anonymous and legacy-key rejection, authenticated health, cross-workspace denial for personal/shared reads and recall/write-back, shared-memory scope validation, enforcement of pending status against a forged import claim, conservative recall gating, include-unconfirmed recall, usage reporting, Agent-review denial, memory inspection, recall trace, and unsafe write-back blocking. To run actual route probes against foreign records/traces, optionally set `OB1_AGENT_MEMORY_FOREIGN_MEMORY_ID` and/or `OB1_AGENT_MEMORY_FOREIGN_REQUEST_ID` to IDs owned by another Agent or a non-allowlisted workspace; the probes are read-only and report only HTTP status, never response content. The unit suite separately exercises cross-Agent and cross-workspace record/trace ownership decisions. It prints a JSON summary and never prints the token.
 
 For personal databases, use the cleanup harness to find or reject smoke/test memories without deleting rows:
 
@@ -156,7 +164,11 @@ The default mode is dry-run. Add `--apply` to mark matching active test memories
 
 **Issue: `Invalid or missing Agent bearer token`**
 
-Solution: Send the Agent's unique token in `Authorization: Bearer ...`, confirm its SHA-256 digest maps to that immutable Agent ID in `AGENT_API_CREDENTIALS_JSON`, and ensure the token is not sent in a URL or legacy header.
+Solution: Send the Agent's unique token in `Authorization: Bearer ...`, confirm its SHA-256 digest maps to that immutable Agent ID in an enabled `agent_api_credentials` row, and ensure the token is not sent in a URL or legacy header.
+
+**Issue: `Agent credential registry is unavailable`**
+
+Solution: Confirm `api-credentials.sql` is applied and the function's existing service-role client has `SELECT` access to `agent_api_credentials`. No Agent credential secret needs to be configured in the Edge Function.
 
 **Issue: `workspace_id is not authorized for this Agent`**
 
