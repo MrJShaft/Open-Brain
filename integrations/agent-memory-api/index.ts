@@ -383,6 +383,304 @@ async function audit(event_type: string, payload: Record<string, unknown>) {
   });
 }
 
+// --- Wellness log (Honey only) ---
+// Personal health data. Never written to agent_memory_audit_events, thoughts,
+// shared memories, or console logs; always scoped to owner === agentId.
+
+const WELLNESS_AGENT_IDS = new Set(["honey"]);
+const TORONTO_TZ = "America/Toronto";
+const WEEKDAY_ORDER = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
+const WELLNESS_FIELD_KEYS = [
+  "kind", "energy", "hunger", "alertness", "food_text", "food_size",
+  "caffeine", "alcohol", "note", "source", "tunnel_progress", "logged_at",
+] as const;
+
+function requireWellnessAgent(c: { get: (k: "agentId") => string; json: (b: unknown, s: 403, h: Record<string, string>) => Response }): Response | null {
+  if (!WELLNESS_AGENT_IDS.has(c.get("agentId"))) {
+    return c.json({ error: "wellness tools are restricted to Honey" }, 403, corsHeaders);
+  }
+  return null;
+}
+
+// Wellness rows can carry health data in Postgres error detail (e.g. "Failing row contains (...)").
+// Never log the error object itself, only its code.
+function wellnessServerError(c: { json: (b: unknown, s: 500, h: Record<string, string>) => Response }, err: unknown) {
+  const code = err && typeof err === "object" && "code" in err ? (err as { code?: unknown }).code : undefined;
+  console.error("agent-memory-api wellness error:", code);
+  return c.json({ error: "Internal error" }, 500, corsHeaders);
+}
+
+type WellnessFields = {
+  kind: string;
+  energy?: number | null;
+  hunger?: number | null;
+  alertness?: number | null;
+  food_text?: string | null;
+  food_size?: string | null;
+  caffeine?: boolean | null;
+  alcohol?: boolean | null;
+  tunnel_progress?: string | null;
+};
+
+function wellnessRuleErrors(v: WellnessFields): string[] {
+  const errors: string[] = [];
+  const hasScore = v.energy != null || v.hunger != null || v.alertness != null;
+  const hasFoodFields = v.food_text != null || v.food_size != null || v.caffeine != null || v.alcohol != null;
+  if (v.kind === "food" && !v.food_text) errors.push("kind 'food' requires food_text");
+  if (v.kind === "missed" && (hasScore || hasFoodFields)) errors.push("kind 'missed' must not carry scores or food fields");
+  if (v.kind === "check_in" && !hasScore && !v.tunnel_progress) errors.push("kind 'check_in' requires at least one of energy/hunger/alertness or tunnel_progress");
+  if (v.kind !== "food" && (v.food_size != null || v.caffeine != null || v.alcohol != null)) errors.push("food_size/caffeine/alcohol are only allowed for kind 'food'");
+  return errors;
+}
+
+const wellnessFieldsSchema = z.object({
+  kind: z.enum(["check_in", "food", "missed"]),
+  energy: z.number().int().min(1).max(5).nullable().optional(),
+  hunger: z.number().int().min(1).max(5).nullable().optional(),
+  alertness: z.number().int().min(1).max(5).nullable().optional(),
+  food_text: z.string().min(1).max(2000).nullable().optional(),
+  food_size: z.enum(["small", "medium", "large"]).nullable().optional(),
+  caffeine: z.boolean().nullable().optional(),
+  alcohol: z.boolean().nullable().optional(),
+  note: z.string().max(2000).nullable().optional(),
+  source: z.enum(["prompted", "unprompted"]).nullable().optional(),
+  tunnel_progress: z.enum(["yes", "a bit", "no"]).nullable().optional(),
+  logged_at: z.string().datetime({ offset: true }).nullable().optional(),
+});
+
+const wellnessInsertSchema = wellnessFieldsSchema.strict().superRefine((data, ctx) => {
+  for (const message of wellnessRuleErrors(data)) ctx.addIssue({ code: "custom", message });
+});
+
+const wellnessPatchSchema = wellnessFieldsSchema.partial().extend({ confirm: z.boolean() }).strict();
+
+// Offset (minutes) such that localTime = utcInstant + offset, for the given zone at that instant.
+function tzOffsetMinutes(instant: Date, timeZone: string): number {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone, hourCycle: "h23",
+    year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  }).formatToParts(instant);
+  const map: Record<string, string> = {};
+  for (const part of parts) map[part.type] = part.value;
+  const asUTC = Date.UTC(Number(map.year), Number(map.month) - 1, Number(map.day), Number(map.hour) % 24, Number(map.minute), Number(map.second));
+  return (asUTC - instant.getTime()) / 60000;
+}
+
+// UTC instant of local midnight on dateStr ("YYYY-MM-DD") in timeZone, DST-correct.
+function localMidnightUTC(dateStr: string, timeZone: string): Date {
+  const guess = new Date(`${dateStr}T00:00:00Z`);
+  const offset1 = tzOffsetMinutes(guess, timeZone);
+  const utc1 = new Date(guess.getTime() - offset1 * 60000);
+  const offset2 = tzOffsetMinutes(utc1, timeZone);
+  return offset2 === offset1 ? utc1 : new Date(guess.getTime() - offset2 * 60000);
+}
+
+function getLocalHour(instant: Date, timeZone: string): number {
+  const hour = new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", hour: "2-digit" })
+    .formatToParts(instant).find((p) => p.type === "hour")?.value ?? "0";
+  return Number(hour) % 24;
+}
+
+function getLocalWeekday(instant: Date, timeZone: string): string {
+  return new Intl.DateTimeFormat("en-US", { timeZone, weekday: "long" }).format(instant);
+}
+
+function getLocalDate(instant: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(instant);
+  const map: Record<string, string> = {};
+  for (const part of parts) map[part.type] = part.value;
+  return `${map.year}-${map.month}-${map.day}`;
+}
+
+function localTimeLabel(instant: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("en-US", { timeZone, hourCycle: "h23", hour: "2-digit", minute: "2-digit" }).formatToParts(instant);
+  const map: Record<string, string> = {};
+  for (const part of parts) map[part.type] = part.value;
+  return `${getLocalDate(instant, timeZone)} ${String(Number(map.hour) % 24).padStart(2, "0")}:${map.minute}`;
+}
+
+function addDaysToDateStr(dateStr: string, days: number): string {
+  const d = new Date(`${dateStr}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function isValidDateStr(s: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) return false;
+  const d = new Date(`${s}T00:00:00Z`);
+  return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === s;
+}
+
+function resolveWellnessRange(c: { req: { query: (k: string) => string | undefined }; json: (b: unknown, s: 400, h: Record<string, string>) => Response }): { from: string; to: string } | Response {
+  const todayLocal = getLocalDate(new Date(), TORONTO_TZ);
+  const from = c.req.query("from") ?? addDaysToDateStr(todayLocal, -14);
+  const to = c.req.query("to") ?? todayLocal;
+  if (!isValidDateStr(from) || !isValidDateStr(to)) return c.json({ error: "from/to must be YYYY-MM-DD" }, 400, corsHeaders);
+  if (to < from) return c.json({ error: "to must be >= from" }, 400, corsHeaders);
+  const rangeDays = Math.round((new Date(`${to}T00:00:00Z`).getTime() - new Date(`${from}T00:00:00Z`).getTime()) / 86400000);
+  if (rangeDays > 366) return c.json({ error: "from/to range must be <= 366 days" }, 400, corsHeaders);
+  return { from, to };
+}
+
+type WellnessRow = {
+  id: string;
+  kind: string;
+  logged_at: string;
+  energy: number | null;
+  hunger: number | null;
+  alertness: number | null;
+  food_text: string | null;
+  tunnel_progress: string | null;
+};
+
+// PostgREST caps a single response at 1000 rows, so callers that need more must page with .range().
+async function fetchWellnessRows(
+  agentId: string,
+  startIso: string,
+  endIso: string,
+  maxRows: number,
+  kind?: string,
+): Promise<{ data: WellnessRow[] | null; error: { code?: string } | null }> {
+  const rows: WellnessRow[] = [];
+  let offset = 0;
+  while (rows.length < maxRows) {
+    let q = supabase
+      .from("agent_wellness_log")
+      .select("*")
+      .eq("owner", agentId)
+      .gte("logged_at", startIso)
+      .lt("logged_at", endIso)
+      .order("logged_at", { ascending: true })
+      .order("id", { ascending: true })
+      .range(offset, offset + 999);
+    if (kind) q = q.eq("kind", kind);
+    const { data, error } = await q;
+    if (error) return { data: null, error };
+    rows.push(...((data || []) as WellnessRow[]));
+    if (!data || data.length < 1000) break;
+    offset += 1000;
+  }
+  return { data: rows.slice(0, maxRows), error: null };
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function average(values: number[]): number | null {
+  if (values.length === 0) return null;
+  return round2(values.reduce((a, b) => a + b, 0) / values.length);
+}
+
+function median(values: number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return round2(sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]);
+}
+
+function summarizeWellness(rows: WellnessRow[], from: string, to: string) {
+  const checkIns = rows.filter((r) => r.kind === "check_in");
+  const foods = rows
+    .filter((r) => r.kind === "food")
+    .map((r) => new Date(r.logged_at).getTime())
+    .sort((a, b) => a - b);
+  const missed = rows.filter((r) => r.kind === "missed");
+
+  const counts = {
+    check_in: checkIns.length,
+    food: rows.filter((r) => r.kind === "food").length,
+    missed: missed.length,
+    total: rows.length,
+  };
+
+  const hourBuckets = new Map<number, { n: number; energy: number[]; hunger: number[]; alertness: number[] }>();
+  const weekdayBuckets = new Map<string, { n: number; energy: number[]; hunger: number[]; alertness: number[] }>();
+  for (const row of checkIns) {
+    const instant = new Date(row.logged_at);
+    const hour = getLocalHour(instant, TORONTO_TZ);
+    const weekday = getLocalWeekday(instant, TORONTO_TZ);
+    const hourBucket = hourBuckets.get(hour) ?? { n: 0, energy: [], hunger: [], alertness: [] };
+    const weekdayBucket = weekdayBuckets.get(weekday) ?? { n: 0, energy: [], hunger: [], alertness: [] };
+    for (const bucket of [hourBucket, weekdayBucket]) {
+      bucket.n += 1;
+      if (row.energy != null) bucket.energy.push(row.energy);
+      if (row.hunger != null) bucket.hunger.push(row.hunger);
+      if (row.alertness != null) bucket.alertness.push(row.alertness);
+    }
+    hourBuckets.set(hour, hourBucket);
+    weekdayBuckets.set(weekday, weekdayBucket);
+  }
+  const by_hour = [...hourBuckets.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([hour, b]) => ({ hour, n: b.n, avg_energy: average(b.energy), avg_hunger: average(b.hunger), avg_alertness: average(b.alertness) }));
+  const by_weekday = WEEKDAY_ORDER.filter((wd) => weekdayBuckets.has(wd)).map((weekday) => {
+    const b = weekdayBuckets.get(weekday)!;
+    return { weekday, n: b.n, avg_energy: average(b.energy), avg_hunger: average(b.hunger), avg_alertness: average(b.alertness) };
+  });
+
+  const lowCheckIns = checkIns.filter((r) => (r.energy != null && r.energy <= 2) || (r.alertness != null && r.alertness <= 2));
+  let withoutPriorFood = 0;
+  const hoursSinceFood: number[] = [];
+  for (const row of lowCheckIns) {
+    const t = new Date(row.logged_at).getTime();
+    let latest: number | null = null;
+    for (const foodTime of foods) {
+      if (foodTime <= t) latest = foodTime;
+      else break;
+    }
+    const hours = latest == null ? null : (t - latest) / 3600000;
+    if (hours == null || hours > 24) withoutPriorFood += 1;
+    else hoursSinceFood.push(hours);
+  }
+  const low_points = {
+    n: lowCheckIns.length,
+    median_hours_since_food: median(hoursSinceFood),
+    avg_hours_since_food: average(hoursSinceFood),
+    without_prior_food: withoutPriorFood,
+  };
+
+  const windowValues: number[][] = Array.from({ length: 24 }, () => []);
+  for (const row of checkIns) {
+    if (row.energy == null && row.alertness == null) continue;
+    const parts = [row.energy, row.alertness].filter((v): v is number => v != null);
+    const score = parts.reduce((a, b) => a + b, 0) / parts.length;
+    const hour = getLocalHour(new Date(row.logged_at), TORONTO_TZ);
+    windowValues[hour].push(score);
+    windowValues[(hour - 1 + 24) % 24].push(score);
+  }
+  const allWindows = windowValues.map((values, h) => ({
+    start_hour: h,
+    end_hour: (h + 2) % 24,
+    label: `${String(h).padStart(2, "0")}:00-${String((h + 2) % 24).padStart(2, "0")}:00`,
+    n: values.length,
+    score: average(values),
+  }));
+  const eligible = allWindows.filter((w) => w.n >= 2 && w.score != null);
+  const pool = eligible.length > 0 ? eligible : allWindows.filter((w) => w.n >= 1 && w.score != null);
+  const best_window = pool.length > 0 ? pool.reduce((a, b) => (b.score! > a.score! ? b : a)) : null;
+  const worst_window = pool.length > 0 ? pool.reduce((a, b) => (b.score! < a.score! ? b : a)) : null;
+
+  const tunnel_progress = { yes: 0, "a bit": 0, no: 0 };
+  for (const row of rows) {
+    if (row.tunnel_progress === "yes") tunnel_progress.yes += 1;
+    else if (row.tunnel_progress === "a bit") tunnel_progress["a bit"] += 1;
+    else if (row.tunnel_progress === "no") tunnel_progress.no += 1;
+  }
+
+  return {
+    range: { from, to, time_zone: TORONTO_TZ },
+    counts,
+    by_hour,
+    by_weekday,
+    low_points,
+    windows_2h: { best_window, worst_window, all: allWindows },
+    missed_check_ins: counts.missed,
+    tunnel_progress,
+  };
+}
+
 const app = new Hono<AppEnv>();
 
 app.options("*", (c) => c.text("ok", 200, corsHeaders));
@@ -420,7 +718,7 @@ app.use("*", async (c, next) => {
 app.get("/health", (c) => c.json({
   ok: true,
   service: "agent-memory-api",
-  version: "0.4.0",
+  version: "0.5.0",
   agent_id: c.get("agentId"),
   workspace_ids: c.get("workspaceIds"),
   capabilities: c.get("capabilities"),
@@ -1108,6 +1406,148 @@ app.get("/recall-traces/:request_id", async (c) => {
     return Boolean(memory && ownsPersonalMemory(agent, memory.workspace_id, memory.metadata));
   });
   return c.json({ trace, items: ownedItems }, 200, corsHeaders);
+});
+
+// --- Wellness routes (Honey only) ---
+
+app.post("/wellness", async (c) => {
+  const guard = requireWellnessAgent(c);
+  if (guard) return guard;
+  const parsed = wellnessInsertSchema.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: "Invalid wellness payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  const req = parsed.data;
+  const agentId = c.get("agentId");
+  const { data, error } = await supabase.from("agent_wellness_log").insert({
+    owner: agentId,
+    kind: req.kind,
+    ...(req.logged_at ? { logged_at: req.logged_at } : {}),
+    energy: req.energy ?? null,
+    hunger: req.hunger ?? null,
+    alertness: req.alertness ?? null,
+    food_text: req.food_text ?? null,
+    food_size: req.food_size ?? null,
+    caffeine: req.caffeine ?? null,
+    alcohol: req.alcohol ?? null,
+    note: req.note ?? null,
+    source: req.source ?? null,
+    tunnel_progress: req.tunnel_progress ?? null,
+  }).select("*").single();
+  if (error) return wellnessServerError(c, error);
+  return c.json({ wellness: data }, 201, corsHeaders);
+});
+
+app.get("/wellness/summary", async (c) => {
+  const guard = requireWellnessAgent(c);
+  if (guard) return guard;
+  const range = resolveWellnessRange(c);
+  if (range instanceof Response) return range;
+  const agentId = c.get("agentId");
+  const startUTC = localMidnightUTC(range.from, TORONTO_TZ);
+  const endUTC = localMidnightUTC(addDaysToDateStr(range.to, 1), TORONTO_TZ);
+  const maxRows = 5000;
+  const { data, error } = await fetchWellnessRows(agentId, startUTC.toISOString(), endUTC.toISOString(), maxRows);
+  if (error) return wellnessServerError(c, error);
+  const rows = data || [];
+  return c.json({ ...summarizeWellness(rows, range.from, range.to), truncated: rows.length >= maxRows }, 200, corsHeaders);
+});
+
+app.get("/wellness", async (c) => {
+  const guard = requireWellnessAgent(c);
+  if (guard) return guard;
+  const range = resolveWellnessRange(c);
+  if (range instanceof Response) return range;
+
+  const kind = c.req.query("kind");
+  if (kind && !["check_in", "food", "missed"].includes(kind)) {
+    return c.json({ error: "kind must be one of check_in, food, missed" }, 400, corsHeaders);
+  }
+  const limitQuery = c.req.query("limit");
+  let limit = 500;
+  if (limitQuery !== undefined) {
+    const n = Number(limitQuery);
+    if (!Number.isInteger(n) || n < 1 || n > 2000) return c.json({ error: "limit must be an integer from 1 to 2000" }, 400, corsHeaders);
+    limit = n;
+  }
+
+  const agentId = c.get("agentId");
+  const startUTC = localMidnightUTC(range.from, TORONTO_TZ);
+  const endUTC = localMidnightUTC(addDaysToDateStr(range.to, 1), TORONTO_TZ);
+
+  const { data, error } = await fetchWellnessRows(agentId, startUTC.toISOString(), endUTC.toISOString(), limit, kind);
+  if (error) return wellnessServerError(c, error);
+  const wellness = (data || []).map((row) => ({ ...row, local_time: localTimeLabel(new Date(row.logged_at), TORONTO_TZ) }));
+  return c.json({ wellness, count: wellness.length, range: { from: range.from, to: range.to, time_zone: TORONTO_TZ } }, 200, corsHeaders);
+});
+
+app.patch("/wellness/:id", async (c) => {
+  const guard = requireWellnessAgent(c);
+  if (guard) return guard;
+  const id = c.req.param("id");
+  if (!z.string().uuid().safeParse(id).success) return c.json({ error: "Wellness entry not found" }, 404, corsHeaders);
+
+  const rawBody = await c.req.json().catch(() => null);
+  if (!rawBody || typeof rawBody !== "object") return c.json({ error: "Invalid JSON body" }, 400, corsHeaders);
+  if ((rawBody as Record<string, unknown>).logged_at === null) {
+    return c.json({ error: "logged_at cannot be null" }, 400, corsHeaders);
+  }
+  if ((rawBody as Record<string, unknown>).kind === null) {
+    return c.json({ error: "kind cannot be null" }, 400, corsHeaders);
+  }
+  const parsed = wellnessPatchSchema.safeParse(rawBody);
+  if (!parsed.success) return c.json({ error: "Invalid wellness patch payload", details: parsed.error.flatten() }, 400, corsHeaders);
+  if (parsed.data.confirm !== true) {
+    return c.json({ error: "confirm=true required (only edit when Tyrone asks)" }, 400, corsHeaders);
+  }
+
+  const agentId = c.get("agentId");
+  const { data: existing, error: existingError } = await supabase
+    .from("agent_wellness_log")
+    .select("*")
+    .eq("id", id)
+    .eq("owner", agentId)
+    .maybeSingle();
+  if (existingError) return wellnessServerError(c, existingError);
+  if (!existing) return c.json({ error: "Wellness entry not found" }, 404, corsHeaders);
+
+  const updateFields: Record<string, unknown> = {};
+  for (const key of WELLNESS_FIELD_KEYS) {
+    if (key in rawBody) updateFields[key] = (parsed.data as Record<string, unknown>)[key] ?? null;
+  }
+
+  const merged = { ...existing, ...updateFields } as WellnessFields;
+  const ruleErrors = wellnessRuleErrors(merged);
+  if (ruleErrors.length > 0) return c.json({ error: "Invalid wellness update", details: ruleErrors }, 400, corsHeaders);
+
+  const { data: updated, error: updateError } = await supabase
+    .from("agent_wellness_log")
+    .update(updateFields)
+    .eq("id", id)
+    .eq("owner", agentId)
+    .select("*")
+    .single();
+  if (updateError) return wellnessServerError(c, updateError);
+  return c.json({ wellness: updated }, 200, corsHeaders);
+});
+
+app.delete("/wellness/:id", async (c) => {
+  const guard = requireWellnessAgent(c);
+  if (guard) return guard;
+  const id = c.req.param("id");
+  if (!z.string().uuid().safeParse(id).success) return c.json({ error: "Wellness entry not found" }, 404, corsHeaders);
+  if (c.req.query("confirm") !== "true") {
+    return c.json({ error: "confirm=true required (only edit when Tyrone asks)" }, 400, corsHeaders);
+  }
+  const agentId = c.get("agentId");
+  const { data, error } = await supabase
+    .from("agent_wellness_log")
+    .delete()
+    .eq("id", id)
+    .eq("owner", agentId)
+    .select("id")
+    .maybeSingle();
+  if (error) return wellnessServerError(c, error);
+  if (!data) return c.json({ error: "Wellness entry not found" }, 404, corsHeaders);
+  return c.json({ deleted: id }, 200, corsHeaders);
 });
 
 Deno.serve((req) => {

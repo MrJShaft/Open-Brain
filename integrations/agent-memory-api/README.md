@@ -127,6 +127,20 @@ The API accepts the runtime-neutral core schema versions and the OpenClaw launch
 
 `GET /shared-memories` requires `workspace_id`. Project-scoped reads also require `project_id`; workspace and organization reads omit it. Results include active confirmed/evidence-only memories by default. Use `include_unconfirmed=true` to include pending entries for review. `POST /shared-memories` accepts a memory type, summary, content, and sharing scope; project scope requires `project_id`. The server sets `created_by_agent`, keeps new entries pending, and never makes Agent-written entries instruction-grade.
 
+## Wellness log (Honey only)
+
+`/wellness` routes store private health check-ins (energy, hunger, alertness, food) for exactly one Agent ID, `honey`. Every other Agent credential gets `403 wellness tools are restricted to Honey`. Rows are never written to `agent_memory_audit_events`, `thoughts`, or `shared_agent_memories`, and are never logged to the console. Every query and write is scoped to `owner = <authenticated agent_id>`; the owner is always server-stamped, never taken from the request body. The table is defined in [`schemas/agent-memory/wellness-log.sql`](../../schemas/agent-memory/wellness-log.sql).
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/wellness` | POST | Record a check-in, food entry, or missed check-in |
+| `/wellness` | GET | List entries in a date range (`from`/`to` as `YYYY-MM-DD`, America/Toronto; `kind`; `limit`, default 500, max 2000) |
+| `/wellness/summary` | GET | By-hour and by-weekday averages, low-energy/low-alertness points with time since last food, best/worst 2-hour windows, missed-check-in count, and tunnel-progress counts over a date range |
+| `/wellness/:id` | PATCH | Edit an entry; requires `confirm: true` in the body |
+| `/wellness/:id` | DELETE | Delete an entry; requires `confirm=true` as a query parameter |
+
+`from`/`to` default to the last 14 days through today (America/Toronto) and the range is capped at 366 days. `kind` is one of `check_in`, `food`, or `missed`; `check_in` requires at least one of `energy`/`hunger`/`alertness` or `tunnel_progress`, `food` requires `food_text`, and `missed` carries no scores or food fields. `food_size`/`caffeine`/`alcohol` are only valid on `food` entries.
+
 ## Expected Outcome
 
 An authenticated Agent can recall relevant context, write back compact memories, and leave a trace that explains what happened. Unsafe write-backs are blocked before durable storage; shared memories are explicitly scoped and remain pending until reviewed.
